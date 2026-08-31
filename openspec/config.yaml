@@ -1,0 +1,38 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+# https://github.com/octocat/Hello-World
+context: |
+  Tech stack: Rust, git cli
+  Domain: cli utility for git clowning and managing worktrees
+  Who uses the cli: developers who manage git repos, under opinionated directory structure
+    example git cloning for git@github.com:octocat/Hello-World.git the director is `$ws/github.com/octocat/Hello-World`
+    example git cloning bare repo for git@github.com:octocat/Hello-World.git the directory is `$ws/bare/github.com/some-org/some-repo/.bare`
+      and worktrees are `$ws/github.com/octocat/Hello-World/$branch/`
+      and `echo "gitdir: ./.bare" > $ws/github.com/octocat/Hello-World/.git`
+      and `git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"`
+      and `git worktree add $branch`
+      and add vscode workspace file `$ws/github.com/octocat/Hello-World/Hello-World.code-workspace` with contents:
+      ```
+      {
+        "folders": [
+          {
+            "path": "."
+          }
+        ],
+        "settings": {}
+      }
+      ```
+
+rules:
+  proposal:
+    - Include rollback plan
+    - Identify affected teams
+    - Testing plan & scenarios
+  specs:
+    - Use Given/When/Then format for scenarios
+  design:
+    - Include sequence diagrams for complex flows

@@ -32,6 +32,12 @@ cd git-clown
 cargo build --release
 ```
 
+Or use the Makefile targets to build and install:
+```sh
+make dev
+make release
+```
+
 3. Add the binary to your PATH:
 ```sh
 # Option 1: Copy to a directory in your PATH
@@ -40,6 +46,10 @@ cp target/release/git-clown ~/.local/bin/
 # Option 2: Create a symbolic link
 ln -s $(pwd)/target/release/git-clown ~/.local/bin/
 ```
+
+Makefile install destinations:
+- `make dev` builds debug and copies to `$(HOME)/bin/git-clown` (override with `TEST_BIN_PATH=/path`)
+- `make release` builds release and copies to `$(HOME)/bin/git-clown` (override with `RELEASE_BIN_PATH=/path`)
 
 ## Usage
 

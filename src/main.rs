@@ -86,6 +86,10 @@ struct Args {
     /// The URL of the git repository to clone
     #[arg(required = true)]
     git_url: String,
+
+    /// Clone as a bare repository and set up an initial worktree for the default branch
+    #[arg(long)]
+    bare: bool,
 }
 
 /// Parses a git URL and extracts components needed for directory structure
@@ -491,19 +495,8 @@ async fn execute_git_clone(
         dir_path.display().to_string().green()
     );
 
-    // Create the command with current directory set
-    let mut command = Command::new("git");
-    command.current_dir(dir_path).arg("clone").arg(git_url);
-
-    // Add environment variables
-    for (key, value) in env_vars {
-        debug!(
-            "Setting environment variable: {}={}",
-            key.cyan(),
-            value.cyan()
-        );
-        command.env(key, value);
-    }
+    // Create the command with current directory and merged environment applied.
+    let mut command = build_git_command(dir_path, &["clone", git_url], env_vars);
 
     debug!("Running command: {:?}", command);
 
@@ -537,6 +530,31 @@ async fn execute_git_clone(
     }
 
     Ok(output.status)
+}
+
+/// Builds a git command with a working directory, argument list, and a merged
+/// environment map applied to the subprocess.
+fn build_git_command(
+    current_dir: &Path,
+    args: &[&str],
+    env_vars: &HashMap<String, String>,
+) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(current_dir).args(args).envs(env_vars);
+    command
+}
+
+/// Merges process and file environment maps, with file values overriding process
+/// values for matching keys.
+fn merge_env_vars(
+    base_env_vars: HashMap<String, String>,
+    file_env_vars: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = base_env_vars;
+    for (key, value) in file_env_vars {
+        merged.insert(key, value);
+    }
+    merged
 }
 
 /// Gets the workspace root directory from the environment or uses default
@@ -616,6 +634,259 @@ async fn repository_exists(dir_path: &Path, repo_name: &str) -> bool {
     false
 }
 
+/// Clones a repository as a bare repo into `<repo_root>/.bare`.
+///
+/// Skips the clone if `.bare` already exists.
+async fn clone_bare(
+    git_url: &str,
+    repo_root: &Path,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), GitClownError> {
+    let bare_path = repo_root.join(".bare");
+
+    if bare_path.exists() {
+        info!(
+            "Bare repository already exists at {}, skipping clone",
+            bare_path.display().to_string().green()
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Cloning bare repository {} into {}",
+        git_url.green(),
+        bare_path.display().to_string().green()
+    );
+
+    let mut command = build_git_command(repo_root, &["clone", "--bare", git_url, ".bare"], env_vars);
+
+    let output = command.output().await.map_err(|e| {
+        error!("Failed to execute git clone --bare: {}", e.to_string().red());
+        GitClownError::GitCloneError(e.to_string())
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.is_empty() {
+        println!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprintln!("{}", stderr);
+    }
+
+    if !output.status.success() {
+        return Err(GitClownError::GitCloneError(format!(
+            "git clone --bare exited with status: {}",
+            output.status
+        )));
+    }
+
+    info!("Bare clone completed successfully");
+    Ok(())
+}
+
+/// Writes `gitdir: ./.bare` to `<repo_root>/.git` so git tools treat the
+/// repo root directory as a git repo backed by the bare store.
+async fn write_git_pointer(repo_root: &Path) -> Result<(), GitClownError> {
+    let git_file = repo_root.join(".git");
+    debug!(
+        "Writing .git pointer at {}",
+        git_file.display().to_string().cyan()
+    );
+    fs::write(&git_file, "gitdir: ./.bare\n")?;
+    info!(
+        "Written .git pointer at {}",
+        git_file.display().to_string().green()
+    );
+    Ok(())
+}
+
+/// Fixes the remote fetch refspec for the bare repo (bare clones omit it by
+/// default) and then runs `git fetch` to populate remote-tracking refs.
+async fn fix_refspec_and_fetch(
+    repo_root: &Path,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), GitClownError> {
+    let output = build_git_command(
+        repo_root,
+        &[
+            "-C",
+            ".bare",
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+        env_vars,
+    )
+        .output()
+        .await
+        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(GitClownError::GitCloneError(format!(
+            "Failed to set fetch refspec: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    info!("Fetch refspec set");
+
+    let output = build_git_command(repo_root, &["-C", ".bare", "fetch"], env_vars)
+        .output()
+        .await
+        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprintln!("{}", stderr);
+    }
+    if !output.status.success() {
+        return Err(GitClownError::GitCloneError(format!(
+            "git fetch failed: {}",
+            stderr
+        )));
+    }
+    info!("git fetch completed");
+    Ok(())
+}
+
+/// Detects the default branch of the bare repo by reading the symbolic `HEAD`
+/// ref. Returns an error if the ref cannot be resolved (e.g. empty repo).
+async fn detect_default_branch(
+    repo_root: &Path,
+    env_vars: &HashMap<String, String>,
+) -> Result<String, GitClownError> {
+    let output = build_git_command(repo_root, &["-C", ".bare", "symbolic-ref", "HEAD"], env_vars)
+        .output()
+        .await
+        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(GitClownError::GitCloneError(
+            "Could not determine default branch: `git symbolic-ref HEAD` failed. \
+             The repository may be empty."
+                .to_string(),
+        ));
+    }
+
+    let ref_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let branch = ref_str
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&ref_str)
+        .to_string();
+
+    if branch.is_empty() {
+        return Err(GitClownError::GitCloneError(
+            "Could not determine default branch: HEAD ref is empty".to_string(),
+        ));
+    }
+
+    info!("Detected default branch: {}", branch.green());
+    Ok(branch)
+}
+
+/// Adds a git worktree for `branch` at `<repo_root>/<branch>`.
+///
+/// Skips the operation if the worktree directory already exists.
+async fn add_worktree(
+    repo_root: &Path,
+    branch: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), GitClownError> {
+    let worktree_path = repo_root.join(branch);
+
+    if worktree_path.exists() {
+        info!(
+            "Worktree directory {} already exists, skipping git worktree add",
+            worktree_path.display().to_string().green()
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Adding worktree for branch {} at {}",
+        branch.green(),
+        worktree_path.display().to_string().green()
+    );
+
+    let output = build_git_command(repo_root, &["worktree", "add", branch], env_vars)
+        .output()
+        .await
+        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.is_empty() {
+        println!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprintln!("{}", stderr);
+    }
+
+    if !output.status.success() {
+        return Err(GitClownError::GitCloneError(format!(
+            "git worktree add {} failed: {}",
+            branch, stderr
+        )));
+    }
+
+    info!("Worktree for branch {} added successfully", branch.green());
+    Ok(())
+}
+
+/// Writes `<repo_root>/<repo>.code-workspace` so VS Code opens the entire
+/// repo directory (including all worktrees) in one workspace.
+///
+/// Skips writing if the file already exists.
+async fn write_vscode_workspace(repo_root: &Path, repo: &str) -> Result<(), GitClownError> {
+    let workspace_file = repo_root.join(format!("{}.code-workspace", repo));
+
+    if workspace_file.exists() {
+        info!(
+            "VS Code workspace file {} already exists, skipping",
+            workspace_file.display().to_string().green()
+        );
+        return Ok(());
+    }
+
+    let content = "{\n  \"folders\": [\n    {\n      \"path\": \".\"\n    }\n  ],\n  \"settings\": {}\n}\n";
+    fs::write(&workspace_file, content)?;
+    info!(
+        "VS Code workspace file written at {}",
+        workspace_file.display().to_string().green()
+    );
+    Ok(())
+}
+
+/// Orchestrates the full bare clone workflow:
+/// bare clone → `.git` pointer → refspec fix → fetch → default branch
+/// detection → worktree add → VS Code workspace file.
+async fn run_bare_clone(
+    git_url: &str,
+    workspace_root: &Path,
+    host: &str,
+    org: &str,
+    repo: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), GitClownError> {
+    let repo_root = workspace_root.join(host).join(org).join(repo);
+    fs::create_dir_all(&repo_root)
+        .map_err(|e| GitClownError::DirectoryCreationError(e.to_string()))?;
+
+    clone_bare(git_url, &repo_root, env_vars).await?;
+    write_git_pointer(&repo_root).await?;
+    fix_refspec_and_fetch(&repo_root, env_vars).await?;
+    let branch: String = detect_default_branch(&repo_root, env_vars).await?;
+    add_worktree(&repo_root, &branch, env_vars).await?;
+    write_vscode_workspace(&repo_root, repo).await?;
+
+    info!(
+        "Bare clone setup complete. Repo root: {}, default branch worktree: {}",
+        repo_root.display().to_string().green(),
+        branch.green()
+    );
+    Ok(())
+}
+
 /// Main application logic flow
 ///
 /// Orchestrates the complete process:
@@ -625,8 +896,8 @@ async fn repository_exists(dir_path: &Path, repo_name: &str) -> bool {
 /// 4. Create directory structure
 /// 5. Find environment file
 /// 6. Load environment variables
-/// 7. Check if repository already exists
-/// 8. Execute git clone (only if repository doesn't exist)
+///    7a. If `--bare`: run bare clone + worktree workflow
+///    7b. Otherwise: check if repository already exists, then execute git clone
 ///
 /// # Returns
 ///
@@ -648,34 +919,57 @@ async fn run() -> Result<std::process::ExitStatus, GitClownError> {
     // Parse git URL
     let (host, org, repo) = parse_git_url(&args.git_url).await?;
 
-    // Create directory structure
+    // Create directory structure (<workspace>/<host>/<org>)
     let dir_path = create_directory_structure(&workspace_root, &host, &org).await?;
 
     // Find environment file
     let env_file = find_env_file(&dir_path, &workspace_root).await?;
 
     // Get current environment as baseline
-    let mut env_vars = HashMap::new();
-    for (key, value) in env::vars() {
-        env_vars.insert(key, value);
-    }
+    let base_env_vars: HashMap<String, String> = env::vars().collect();
 
     // If an environment file was found, load its variables
     if let Some(env_file_path) = env_file {
-        // Read environment variables from file
         let file_env_vars = read_env_file(&env_file_path).await?;
+        let env_vars = merge_env_vars(base_env_vars, file_env_vars);
 
-        // Merge the file environment variables with the current ones
-        for (key, value) in file_env_vars {
-            debug!(
-                "Adding environment variable from file: {}={}",
-                key.cyan(),
-                value.cyan()
-            );
-            env_vars.insert(key, value);
+        // Bare clone path: set up bare repo + worktree
+        if args.bare {
+            run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+            return StdCommand::new("true")
+                .status()
+                .map_err(GitClownError::IoError);
         }
+
+        // Check if the repository already exists
+        if repository_exists(&dir_path, &repo).await {
+            info!(
+                "Repository {} already exists, skipping git clone",
+                repo.green()
+            );
+            // Create a successful exit status in a cross-platform way
+            let status = StdCommand::new("true").status().unwrap_or_else(|_| {
+                // Fallback if running the 'true' command fails
+                warn!("Failed to create exit status, using default success status");
+                panic!("Failed to create exit status");
+            });
+            return Ok(status);
+        }
+
+        // Execute git clone with environment variables
+        return execute_git_clone(&args.git_url, &dir_path, &env_vars).await;
     } else {
         warn!("No environment file found, proceeding with system environment only");
+    }
+
+    let env_vars = base_env_vars;
+
+    // Bare clone path: set up bare repo + worktree
+    if args.bare {
+        run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+        return StdCommand::new("true")
+            .status()
+            .map_err(GitClownError::IoError);
     }
 
     // Check if the repository already exists
@@ -929,5 +1223,173 @@ mod tests {
         fs::create_dir_all(&not_repo_dir).unwrap();
         
         assert!(!repository_exists(parent_dir, not_repo_name).await);
+    }
+
+    /// Creates a minimal git repo with one commit in `dir`, using `branch` as the
+    /// initial branch name. Returns without error; panics on setup failure.
+    fn init_git_repo_with_commit(dir: &Path, branch: &str) {
+        let run = |args: &[&str]| {
+            StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-b", branch]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test User"]);
+        fs::write(dir.join("README.md"), "test").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_default_branch_main() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        // Create source repo on branch "main"
+        let source = ws.join("source");
+        fs::create_dir_all(&source).unwrap();
+        init_git_repo_with_commit(&source, "main");
+
+        // Bare clone into repo_root/.bare
+        let repo_root = ws.join("repo_root");
+        fs::create_dir_all(&repo_root).unwrap();
+        StdCommand::new("git")
+            .args(["clone", "--bare", source.to_str().unwrap(), ".bare"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+
+        let env_vars: HashMap<String, String> = std::env::vars().collect();
+        let branch = detect_default_branch(&repo_root, &env_vars).await.unwrap();
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_detect_default_branch_master() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let source = ws.join("source");
+        fs::create_dir_all(&source).unwrap();
+        init_git_repo_with_commit(&source, "master");
+
+        let repo_root = ws.join("repo_root");
+        fs::create_dir_all(&repo_root).unwrap();
+        StdCommand::new("git")
+            .args(["clone", "--bare", source.to_str().unwrap(), ".bare"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+
+        let env_vars: HashMap<String, String> = std::env::vars().collect();
+        let branch = detect_default_branch(&repo_root, &env_vars).await.unwrap();
+        assert_eq!(branch, "master");
+    }
+
+    #[tokio::test]
+    async fn test_run_bare_clone_full_workflow() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        // Create a source git repo
+        let source = ws.join("source");
+        fs::create_dir_all(&source).unwrap();
+        init_git_repo_with_commit(&source, "main");
+
+        let workspace_root = ws.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let env_vars: HashMap<String, String> = std::env::vars().collect();
+
+        run_bare_clone(
+            source.to_str().unwrap(),
+            &workspace_root,
+            "localhost",
+            "org",
+            "myrepo",
+            &env_vars,
+        )
+        .await
+        .unwrap();
+
+        let repo_root = workspace_root.join("localhost").join("org").join("myrepo");
+
+        // .bare directory exists
+        assert!(repo_root.join(".bare").is_dir(), ".bare should be a directory");
+
+        // .git pointer file has correct content
+        let git_content = fs::read_to_string(repo_root.join(".git")).unwrap();
+        assert_eq!(git_content.trim(), "gitdir: ./.bare");
+
+        // worktree for default branch exists
+        assert!(repo_root.join("main").is_dir(), "main worktree should exist");
+
+        // .code-workspace file exists with expected content
+        let ws_file = repo_root.join("myrepo.code-workspace");
+        assert!(ws_file.exists(), ".code-workspace file should exist");
+        let ws_content = fs::read_to_string(&ws_file).unwrap();
+        assert!(ws_content.contains("\"path\": \".\""), "workspace file should reference '.'");
+    }
+
+    #[test]
+    fn test_merge_env_vars_file_overrides_base() {
+        let mut base = HashMap::new();
+        base.insert("SAME_KEY".to_string(), "base-value".to_string());
+        base.insert("ONLY_BASE".to_string(), "base-only".to_string());
+
+        let mut file = HashMap::new();
+        file.insert("SAME_KEY".to_string(), "file-value".to_string());
+        file.insert("ONLY_FILE".to_string(), "file-only".to_string());
+
+        let merged = merge_env_vars(base, file);
+
+        assert_eq!(merged.get("SAME_KEY"), Some(&"file-value".to_string()));
+        assert_eq!(merged.get("ONLY_BASE"), Some(&"base-only".to_string()));
+        assert_eq!(merged.get("ONLY_FILE"), Some(&"file-only".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_run_bare_clone_propagates_env_to_non_clone_git_steps() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let source = ws.join("source");
+        fs::create_dir_all(&source).unwrap();
+        init_git_repo_with_commit(&source, "main");
+
+        let workspace_root = ws.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let trace_file = ws.join("git-trace.log");
+        let mut env_vars: HashMap<String, String> = std::env::vars().collect();
+        env_vars.insert(
+            "GIT_TRACE".to_string(),
+            trace_file.to_string_lossy().to_string(),
+        );
+
+        run_bare_clone(
+            source.to_str().unwrap(),
+            &workspace_root,
+            "localhost",
+            "org",
+            "myrepo",
+            &env_vars,
+        )
+        .await
+        .unwrap();
+
+        let trace = fs::read_to_string(&trace_file).unwrap();
+        assert!(trace.contains(" fetch"), "trace should include git fetch invocation");
+        assert!(
+            trace.contains(" symbolic-ref HEAD"),
+            "trace should include git symbolic-ref invocation"
+        );
+        assert!(
+            trace.contains("worktree add"),
+            "trace should include git worktree add invocation"
+        );
     }
 }
