@@ -14,6 +14,7 @@ Key features:
 - Async operations for better performance
 - Optional shell integration (bash, zsh) so `git clown <url>` leaves you inside the cloned repository
 - `git-clown doctor` to check your setup and install the shell integration
+- Optional terminal pager that renders the cloned repository's README (and these docs) as formatted markdown
 
 ## Installation
 
@@ -137,10 +138,46 @@ If the integration is missing and you run doctor in a terminal, it asks whether
 to install it. Use `--install` to install without asking, and `--shell` to pick
 the shell(s). It exits with a non-zero status when a check fails.
 
+### Reading the README in a Pager
+
+Add `--readme` to read the repository's README right after cloning:
+
+```sh
+git-clown --readme https://github.com/example/repo.git
+```
+
+Once the clone succeeds (or the repository turns out to be cloned already), the README opens in a full-screen pager with headings, emphasis, lists, code blocks, tables and links formatted for the terminal. Text is wrapped to the terminal width, table cells included; only a table with more columns than the screen can hold is wider, and then you can scroll sideways. With `--bare`, the README of the default branch worktree is shown. If the repository has no `README.md` (or `README.markdown`), a warning is logged and nothing else happens. A failed clone never opens the pager. With the [shell integration](#shell-integration-cd-into-the-clone) loaded, `git clown --readme <url>` `cd`s into the repository once you close the pager.
+
+To read git-clown's own documentation (this file) the same way:
+
+```sh
+git-clown --docs
+```
+
+Keys in the pager:
+
+| Key | Action |
+|-----|--------|
+| `q`, `Esc`, `Ctrl-C` | Quit |
+| `↓`, `j`, `Enter` / `↑`, `k` | Scroll one line down / up |
+| `Space`, `f`, `PageDown` / `b`, `PageUp` | Scroll one page down / up |
+| `d` / `u` | Scroll half a page down / up |
+| `g`, `Home` / `G`, `End` | Go to the top / end |
+| `←`, `h` / `→`, `l` | Scroll sideways, when the status bar says there is more to the side |
+
+The pager is only used when stdout is a terminal. When the output is piped or redirected (or `TERM=dumb`), the markdown is printed unchanged instead, so `git-clown --docs | less` or `git-clown --docs > git-clown.md` work as expected.
+
+To always show the README, set `GIT_CLOWN_README` in your shell profile instead of passing the flag each time:
+
+```sh
+export GIT_CLOWN_README=1
+```
+
 ### Environment Variables
 
 - `WORKSPACE_ROOT`: Set this environment variable to specify your workspace root directory. If not set, it defaults to `~/ws/`.
 - `GIT_CLOWN_CD_FILE`: Set by the shell integration. After a successful clone, git-clown writes the repository directory to this file.
+- `GIT_CLOWN_README`: Set to `1` (or `true`, `yes`, `on`) to show the README after every clone, as if `--readme` were passed. `0`, `false`, `no` or `off` turn it off.
 
 ### Environment File Support
 
