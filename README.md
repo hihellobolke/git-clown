@@ -12,6 +12,7 @@ Key features:
 - Support for both HTTPS and SSH Git URLs
 - Colored logging output for enhanced readability
 - Async operations for better performance
+- Optional terminal pager that renders the cloned repository's README (and these docs) as formatted markdown
 
 ## Installation
 
@@ -66,9 +67,44 @@ This will:
 4. Load environment variables from the found file
 5. Clone the repository into this directory (if not already cloned)
 
+### Reading the README in a Pager
+
+Add `--readme` to read the repository's README right after cloning:
+
+```sh
+git-clown --readme https://github.com/example/repo.git
+```
+
+Once the clone succeeds (or the repository turns out to be cloned already), the README opens in a full-screen pager with headings, emphasis, lists, code blocks, tables and links formatted for the terminal. With `--bare`, the README of the default branch worktree is shown. If the repository has no `README.md` (or `README.markdown`), a warning is logged and nothing else happens. A failed clone never opens the pager.
+
+To read git-clown's own documentation (this file) the same way:
+
+```sh
+git-clown --docs
+```
+
+Keys in the pager:
+
+| Key | Action |
+|-----|--------|
+| `q`, `Esc`, `Ctrl-C` | Quit |
+| `↓`, `j`, `Enter` / `↑`, `k` | Scroll one line down / up |
+| `Space`, `f`, `PageDown` / `b`, `PageUp` | Scroll one page down / up |
+| `d` / `u` | Scroll half a page down / up |
+| `g`, `Home` / `G`, `End` | Go to the top / end |
+
+The pager is only used when stdout is a terminal. When the output is piped or redirected (or `TERM=dumb`), the markdown is printed unchanged instead, so `git-clown --docs | less` or `git-clown --docs > git-clown.md` work as expected.
+
+To always show the README, set `GIT_CLOWN_README` in your shell profile instead of passing the flag each time:
+
+```sh
+export GIT_CLOWN_README=1
+```
+
 ### Environment Variables
 
 - `WORKSPACE_ROOT`: Set this environment variable to specify your workspace root directory. If not set, it defaults to `~/ws/`.
+- `GIT_CLOWN_README`: Set to `1` (or `true`, `yes`, `on`) to show the README after every clone, as if `--readme` were passed. `0`, `false`, `no` or `off` turn it off.
 
 ### Environment File Support
 

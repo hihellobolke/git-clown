@@ -15,18 +15,25 @@
 //! * Passes environment variables to git clone
 //! * Async operations with Tokio
 //! * Colored logging output
+//! * Optional markdown pager for the cloned repository's README and for these docs
 //!
 //! ## Usage
 //!
 //! ```
 //! git-clown https://github.com/example/repo.git
+//! git-clown --readme https://github.com/example/repo.git
+//! git-clown --docs
 //! ```
 //!
 //! Environment variables:
 //! * `WORKSPACE_ROOT`: The root directory for the workspace. Defaults to `~/ws/` if not set.
+//! * `GIT_CLOWN_README`: Set to `true` to always show the README (same as `--readme`).
+
+mod markdown;
+mod pager;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{builder::BoolishValueParser, Parser};
 use colored::Colorize;
 use dotenvy;
 use log::{debug, error, info, warn};
@@ -84,13 +91,28 @@ enum GitClownError {
 )]
 struct Args {
     /// The URL of the git repository to clone
-    #[arg(required = true)]
-    git_url: String,
+    #[arg(required_unless_present = "docs")]
+    git_url: Option<String>,
 
     /// Clone as a bare repository and set up an initial worktree for the default branch
     #[arg(long)]
     bare: bool,
+
+    /// After cloning, show the repository's README in a terminal pager
+    /// (printed as plain text when stdout is not a terminal)
+    #[arg(long, env = "GIT_CLOWN_README", value_parser = BoolishValueParser::new())]
+    readme: bool,
+
+    /// Show the git-clown documentation in a terminal pager and exit
+    #[arg(long, conflicts_with_all = ["git_url", "bare"])]
+    docs: bool,
 }
+
+/// git-clown's own documentation, shown by `--docs`
+const DOCS: &str = include_str!("../README.md");
+
+/// README file names tried, in order, when showing a cloned repository's README
+const README_NAMES: [&str; 4] = ["README.md", "README.markdown", "readme.md", "Readme.md"];
 
 /// Parses a git URL and extracts components needed for directory structure
 ///
@@ -860,6 +882,8 @@ async fn write_vscode_workspace(repo_root: &Path, repo: &str) -> Result<(), GitC
 /// Orchestrates the full bare clone workflow:
 /// bare clone → `.git` pointer → refspec fix → fetch → default branch
 /// detection → worktree add → VS Code workspace file.
+///
+/// Returns the path of the default branch worktree.
 async fn run_bare_clone(
     git_url: &str,
     workspace_root: &Path,
@@ -867,7 +891,7 @@ async fn run_bare_clone(
     org: &str,
     repo: &str,
     env_vars: &HashMap<String, String>,
-) -> Result<(), GitClownError> {
+) -> Result<PathBuf, GitClownError> {
     let repo_root = workspace_root.join(host).join(org).join(repo);
     fs::create_dir_all(&repo_root)
         .map_err(|e| GitClownError::DirectoryCreationError(e.to_string()))?;
@@ -884,13 +908,67 @@ async fn run_bare_clone(
         repo_root.display().to_string().green(),
         branch.green()
     );
+    Ok(repo_root.join(branch))
+}
+
+/// Finds a markdown README at the top of a checkout.
+///
+/// Tries the names in [`README_NAMES`] in order and returns the first that is a file.
+fn find_readme(checkout: &Path) -> Option<PathBuf> {
+    README_NAMES
+        .iter()
+        .map(|name| checkout.join(name))
+        .find(|path| path.is_file())
+}
+
+/// Shows markdown in the terminal pager without blocking the async runtime.
+async fn show_markdown(title: String, markdown: String) -> Result<(), GitClownError> {
+    tokio::task::spawn_blocking(move || pager::show(&title, &markdown)).await??;
     Ok(())
+}
+
+/// Shows the README of a checkout in the terminal pager, titled with its path
+/// relative to the workspace root.
+///
+/// A missing or unreadable README, or a pager failure, is logged as a warning:
+/// the clone itself has already succeeded.
+async fn show_readme(workspace_root: &Path, checkout: &Path) {
+    let Some(readme) = find_readme(checkout) else {
+        warn!(
+            "No markdown README found in {}",
+            checkout.display().to_string().yellow()
+        );
+        return;
+    };
+    let title = readme
+        .strip_prefix(workspace_root)
+        .unwrap_or(&readme)
+        .display()
+        .to_string();
+    let result = match fs::read_to_string(&readme) {
+        Ok(markdown) => show_markdown(title, markdown).await,
+        Err(e) => Err(GitClownError::IoError(e)),
+    };
+    if let Err(e) = result {
+        warn!(
+            "Failed to show {}: {}",
+            readme.display().to_string().yellow(),
+            e.to_string().yellow()
+        );
+    }
+}
+
+/// Returns a successful exit status in a cross-platform way.
+fn success_status() -> Result<std::process::ExitStatus, GitClownError> {
+    StdCommand::new("true")
+        .status()
+        .map_err(GitClownError::IoError)
 }
 
 /// Main application logic flow
 ///
 /// Orchestrates the complete process:
-/// 1. Parse command line arguments
+/// 1. Parse command line arguments (with `--docs`, show the docs and stop)
 /// 2. Get workspace root directory
 /// 3. Parse git URL
 /// 4. Create directory structure
@@ -898,6 +976,7 @@ async fn run_bare_clone(
 /// 6. Load environment variables
 ///    7a. If `--bare`: run bare clone + worktree workflow
 ///    7b. Otherwise: check if repository already exists, then execute git clone
+/// 8. If `--readme` and the clone succeeded: show the README in the pager
 ///
 /// # Returns
 ///
@@ -911,13 +990,20 @@ async fn run() -> Result<std::process::ExitStatus, GitClownError> {
 
     // Parse command-line arguments
     let args = Args::parse();
-    info!("Git URL: {}", args.git_url.green());
+    if args.docs {
+        show_markdown("git-clown".to_string(), DOCS.to_string()).await?;
+        return success_status();
+    }
+    let git_url = args
+        .git_url
+        .expect("clap requires git_url unless --docs is given");
+    info!("Git URL: {}", git_url.green());
 
     // Get workspace root
     let workspace_root = get_workspace_root().await;
 
     // Parse git URL
-    let (host, org, repo) = parse_git_url(&args.git_url).await?;
+    let (host, org, repo) = parse_git_url(&git_url).await?;
 
     // Create directory structure (<workspace>/<host>/<org>)
     let dir_path = create_directory_structure(&workspace_root, &host, &org).await?;
@@ -925,70 +1011,38 @@ async fn run() -> Result<std::process::ExitStatus, GitClownError> {
     // Find environment file
     let env_file = find_env_file(&dir_path, &workspace_root).await?;
 
-    // Get current environment as baseline
+    // Get current environment as baseline, overridden by the environment file if any
     let base_env_vars: HashMap<String, String> = env::vars().collect();
+    let env_vars = match env_file {
+        Some(env_file_path) => merge_env_vars(base_env_vars, read_env_file(&env_file_path).await?),
+        None => {
+            warn!("No environment file found, proceeding with system environment only");
+            base_env_vars
+        }
+    };
 
-    // If an environment file was found, load its variables
-    if let Some(env_file_path) = env_file {
-        let file_env_vars = read_env_file(&env_file_path).await?;
-        let env_vars = merge_env_vars(base_env_vars, file_env_vars);
-
+    let (status, checkout) = if args.bare {
         // Bare clone path: set up bare repo + worktree
-        if args.bare {
-            run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
-            return StdCommand::new("true")
-                .status()
-                .map_err(GitClownError::IoError);
-        }
-
-        // Check if the repository already exists
-        if repository_exists(&dir_path, &repo).await {
-            info!(
-                "Repository {} already exists, skipping git clone",
-                repo.green()
-            );
-            // Create a successful exit status in a cross-platform way
-            let status = StdCommand::new("true").status().unwrap_or_else(|_| {
-                // Fallback if running the 'true' command fails
-                warn!("Failed to create exit status, using default success status");
-                panic!("Failed to create exit status");
-            });
-            return Ok(status);
-        }
-
-        // Execute git clone with environment variables
-        return execute_git_clone(&args.git_url, &dir_path, &env_vars).await;
-    } else {
-        warn!("No environment file found, proceeding with system environment only");
-    }
-
-    let env_vars = base_env_vars;
-
-    // Bare clone path: set up bare repo + worktree
-    if args.bare {
-        run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
-        return StdCommand::new("true")
-            .status()
-            .map_err(GitClownError::IoError);
-    }
-
-    // Check if the repository already exists
-    if repository_exists(&dir_path, &repo).await {
+        let worktree =
+            run_bare_clone(&git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+        (success_status()?, worktree)
+    } else if repository_exists(&dir_path, &repo).await {
         info!(
             "Repository {} already exists, skipping git clone",
             repo.green()
         );
-        // Create a successful exit status in a cross-platform way
-        let status = StdCommand::new("true").status().unwrap_or_else(|_| {
-            // Fallback if running the 'true' command fails
-            warn!("Failed to create exit status, using default success status");
-            panic!("Failed to create exit status");
-        });
-        return Ok(status);
+        (success_status()?, dir_path.join(&repo))
+    } else {
+        // Execute git clone with environment variables
+        let status = execute_git_clone(&git_url, &dir_path, &env_vars).await?;
+        (status, dir_path.join(&repo))
+    };
+
+    if args.readme && status.success() {
+        show_readme(&workspace_root, &checkout).await;
     }
 
-    // Execute git clone with environment variables
-    execute_git_clone(&args.git_url, &dir_path, &env_vars).await
+    Ok(status)
 }
 
 /// Application entry point
@@ -1304,7 +1358,7 @@ mod tests {
 
         let env_vars: HashMap<String, String> = std::env::vars().collect();
 
-        run_bare_clone(
+        let worktree = run_bare_clone(
             source.to_str().unwrap(),
             &workspace_root,
             "localhost",
@@ -1316,6 +1370,11 @@ mod tests {
         .unwrap();
 
         let repo_root = workspace_root.join("localhost").join("org").join("myrepo");
+        assert_eq!(
+            worktree,
+            repo_root.join("main"),
+            "should return the worktree path"
+        );
 
         // .bare directory exists
         assert!(repo_root.join(".bare").is_dir(), ".bare should be a directory");
@@ -1391,5 +1450,59 @@ mod tests {
             trace.contains("worktree add"),
             "trace should include git worktree add invocation"
         );
+    }
+
+    #[test]
+    fn test_args_docs_needs_no_url() {
+        let args = Args::try_parse_from(["git-clown", "--docs"]).unwrap();
+        assert!(args.docs);
+        assert!(args.git_url.is_none());
+    }
+
+    #[test]
+    fn test_args_url_required_without_docs() {
+        assert!(Args::try_parse_from(["git-clown"]).is_err());
+        assert!(Args::try_parse_from(["git-clown", "--readme"]).is_err());
+    }
+
+    #[test]
+    fn test_args_docs_conflicts_with_clone_options() {
+        assert!(Args::try_parse_from(["git-clown", "--docs", "https://h/o/r"]).is_err());
+        assert!(Args::try_parse_from(["git-clown", "--docs", "--bare"]).is_err());
+    }
+
+    #[test]
+    fn test_args_readme_flag() {
+        let args = Args::try_parse_from(["git-clown", "--readme", "https://h/o/r"]).unwrap();
+        assert!(args.readme);
+        assert_eq!(args.git_url.as_deref(), Some("https://h/o/r"));
+    }
+
+    #[test]
+    fn test_docs_are_the_readme() {
+        assert!(DOCS.starts_with("# Git Clown"));
+    }
+
+    #[test]
+    fn test_find_readme() {
+        let temp = tempdir().unwrap();
+        assert_eq!(find_readme(temp.path()), None);
+
+        fs::write(temp.path().join("README.markdown"), "long").unwrap();
+        assert_eq!(
+            find_readme(temp.path()),
+            Some(temp.path().join("README.markdown"))
+        );
+
+        fs::write(temp.path().join("README.md"), "short").unwrap();
+        assert_eq!(
+            find_readme(temp.path()),
+            Some(temp.path().join("README.md"))
+        );
+
+        // A directory named like a README is not a README.
+        let dir_only = temp.path().join("dir-only");
+        fs::create_dir_all(dir_only.join("README.md")).unwrap();
+        assert_eq!(find_readme(&dir_only), None);
     }
 }
