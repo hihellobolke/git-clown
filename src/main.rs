@@ -624,9 +624,7 @@ async fn repository_exists(dir_path: &Path, repo_name: &str) -> bool {
     );
 
     if repo_path.exists() && repo_path.is_dir() && git_dir_path.exists() && git_dir_path.is_dir() {
-        debug!(
-            "Repository directory exists and contains .git directory"
-        );
+        debug!("Repository directory exists and contains .git directory");
         return true;
     }
 
@@ -658,10 +656,14 @@ async fn clone_bare(
         bare_path.display().to_string().green()
     );
 
-    let mut command = build_git_command(repo_root, &["clone", "--bare", git_url, ".bare"], env_vars);
+    let mut command =
+        build_git_command(repo_root, &["clone", "--bare", git_url, ".bare"], env_vars);
 
     let output = command.output().await.map_err(|e| {
-        error!("Failed to execute git clone --bare: {}", e.to_string().red());
+        error!(
+            "Failed to execute git clone --bare: {}",
+            e.to_string().red()
+        );
         GitClownError::GitCloneError(e.to_string())
     })?;
 
@@ -718,9 +720,9 @@ async fn fix_refspec_and_fetch(
         ],
         env_vars,
     )
-        .output()
-        .await
-        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+    .output()
+    .await
+    .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
 
     if !output.status.success() {
         return Err(GitClownError::GitCloneError(format!(
@@ -755,10 +757,14 @@ async fn detect_default_branch(
     repo_root: &Path,
     env_vars: &HashMap<String, String>,
 ) -> Result<String, GitClownError> {
-    let output = build_git_command(repo_root, &["-C", ".bare", "symbolic-ref", "HEAD"], env_vars)
-        .output()
-        .await
-        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+    let output = build_git_command(
+        repo_root,
+        &["-C", ".bare", "symbolic-ref", "HEAD"],
+        env_vars,
+    )
+    .output()
+    .await
+    .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
 
     if !output.status.success() {
         return Err(GitClownError::GitCloneError(
@@ -848,7 +854,8 @@ async fn write_vscode_workspace(repo_root: &Path, repo: &str) -> Result<(), GitC
         return Ok(());
     }
 
-    let content = "{\n  \"folders\": [\n    {\n      \"path\": \".\"\n    }\n  ],\n  \"settings\": {}\n}\n";
+    let content =
+        "{\n  \"folders\": [\n    {\n      \"path\": \".\"\n    }\n  ],\n  \"settings\": {}\n}\n";
     fs::write(&workspace_file, content)?;
     info!(
         "VS Code workspace file written at {}",
@@ -935,7 +942,15 @@ async fn run() -> Result<std::process::ExitStatus, GitClownError> {
 
         // Bare clone path: set up bare repo + worktree
         if args.bare {
-            run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+            run_bare_clone(
+                &args.git_url,
+                &workspace_root,
+                &host,
+                &org,
+                &repo,
+                &env_vars,
+            )
+            .await?;
             return StdCommand::new("true")
                 .status()
                 .map_err(GitClownError::IoError);
@@ -966,7 +981,15 @@ async fn run() -> Result<std::process::ExitStatus, GitClownError> {
 
     // Bare clone path: set up bare repo + worktree
     if args.bare {
-        run_bare_clone(&args.git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+        run_bare_clone(
+            &args.git_url,
+            &workspace_root,
+            &host,
+            &org,
+            &repo,
+            &env_vars,
+        )
+        .await?;
         return StdCommand::new("true")
             .status()
             .map_err(GitClownError::IoError);
@@ -1203,25 +1226,25 @@ mod tests {
     async fn test_repository_exists() {
         let temp_dir = tempdir().unwrap();
         let parent_dir = temp_dir.path();
-        
+
         // Create a fake repository with a .git directory
         let repo_name = "test-repo";
         let repo_dir = parent_dir.join(repo_name);
         let git_dir = repo_dir.join(".git");
-        
+
         fs::create_dir_all(&git_dir).unwrap();
-        
+
         // Test that repository is detected
         assert!(repository_exists(parent_dir, repo_name).await);
-        
+
         // Test that non-existent repository is not detected
         assert!(!repository_exists(parent_dir, "nonexistent-repo").await);
-        
+
         // Test that a directory without .git is not detected as repository
         let not_repo_name = "not-a-repo";
         let not_repo_dir = parent_dir.join(not_repo_name);
         fs::create_dir_all(&not_repo_dir).unwrap();
-        
+
         assert!(!repository_exists(parent_dir, not_repo_name).await);
     }
 
@@ -1318,20 +1341,29 @@ mod tests {
         let repo_root = workspace_root.join("localhost").join("org").join("myrepo");
 
         // .bare directory exists
-        assert!(repo_root.join(".bare").is_dir(), ".bare should be a directory");
+        assert!(
+            repo_root.join(".bare").is_dir(),
+            ".bare should be a directory"
+        );
 
         // .git pointer file has correct content
         let git_content = fs::read_to_string(repo_root.join(".git")).unwrap();
         assert_eq!(git_content.trim(), "gitdir: ./.bare");
 
         // worktree for default branch exists
-        assert!(repo_root.join("main").is_dir(), "main worktree should exist");
+        assert!(
+            repo_root.join("main").is_dir(),
+            "main worktree should exist"
+        );
 
         // .code-workspace file exists with expected content
         let ws_file = repo_root.join("myrepo.code-workspace");
         assert!(ws_file.exists(), ".code-workspace file should exist");
         let ws_content = fs::read_to_string(&ws_file).unwrap();
-        assert!(ws_content.contains("\"path\": \".\""), "workspace file should reference '.'");
+        assert!(
+            ws_content.contains("\"path\": \".\""),
+            "workspace file should reference '.'"
+        );
     }
 
     #[test]
@@ -1382,7 +1414,10 @@ mod tests {
         .unwrap();
 
         let trace = fs::read_to_string(&trace_file).unwrap();
-        assert!(trace.contains(" fetch"), "trace should include git fetch invocation");
+        assert!(
+            trace.contains(" fetch"),
+            "trace should include git fetch invocation"
+        );
         assert!(
             trace.contains(" symbolic-ref HEAD"),
             "trace should include git symbolic-ref invocation"
