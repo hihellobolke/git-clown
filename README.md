@@ -21,7 +21,7 @@ The full documentation (a getting-started tutorial, how-to guides, reference and
 ## Installation
 
 ### Prerequisites
-- Rust and Cargo (1.56.0 or later)
+- Rust and Cargo (1.88 or later)
 - Git
 
 ### Building from Source

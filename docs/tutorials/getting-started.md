@@ -13,7 +13,7 @@ You need:
 
 - a Linux or macOS machine with **bash** or **zsh** as your shell
 - **git**
-- a **Rust toolchain** (`cargo`), version 1.80 or later. Get it from
+- a **Rust toolchain** (`cargo`), version 1.88 or later. Get it from
   <https://rustup.rs> if you don't have it.
 - network access to GitHub
 
