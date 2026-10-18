@@ -160,25 +160,54 @@ pub fn rc_state(shell: Shell, content: &str) -> RcState {
 
 /// Whether a non-comment part of `content` runs `git-clown init <shell>`.
 fn loads_manually(shell: Shell, content: &str) -> bool {
-    let command = format!("git-clown init {}", shell.name());
-    content
-        .lines()
-        .any(|line| strip_comment(line).contains(&command))
+    strip_comments(content).contains(&format!("git-clown init {}", shell.name()))
 }
 
-/// Drops a shell comment: a `#` at the start of a word and everything after it.
-fn strip_comment(line: &str) -> &str {
-    let comment_start = line
-        .char_indices()
-        .find(|&(i, c)| {
-            c == '#'
-                && line[..i]
-                    .chars()
-                    .next_back()
-                    .is_none_or(char::is_whitespace)
-        })
-        .map_or(line.len(), |(i, _)| i);
-    &line[..comment_start]
+/// Removes shell comments from `content`, following the shell's rule: an
+/// unquoted, unescaped `#` at the start of a word (after whitespace, an
+/// operator such as `;`, `&`, `|`, `(`, `)`, `<`, `>`, or at the start of
+/// the input) comments out the rest of the line. Quote state carries across
+/// lines, so a `#` inside a multi-line string is kept.
+fn strip_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let (mut single, mut double, mut escaped, mut in_comment) = (false, false, false, false);
+    // Whether the next character would start a new word.
+    let mut word_start = true;
+
+    for c in content.chars() {
+        if in_comment {
+            if c == '\n' {
+                in_comment = false;
+                word_start = true;
+                out.push(c);
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            word_start = false;
+        } else if single {
+            single = c != '\'';
+        } else if c == '\\' {
+            escaped = true;
+            word_start = false;
+        } else if c == '"' {
+            double = !double;
+            word_start = false;
+        } else if double {
+            // Everything else inside double quotes is literal for our purposes.
+        } else if c == '\'' {
+            single = true;
+            word_start = false;
+        } else if c == '#' && word_start {
+            in_comment = true;
+            continue;
+        } else {
+            word_start = c.is_whitespace() || ";&|()<>".contains(c);
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Returns `content` with `shell`'s managed block added or refreshed, along
@@ -357,6 +386,11 @@ mod tests {
                 format!("# To install later: eval \"$(git-clown init {name})\"\n"),
                 format!("   #eval \"$(git-clown init {name})\"\n"),
                 format!("echo hi # git-clown init {name}\n"),
+                format!("true;# eval \"$(git-clown init {name})\"\n"),
+                format!("true &&#eval \"$(git-clown init {name})\"\n"),
+                format!("(true)# git-clown init {name}\n"),
+                format!("x=1|#git-clown init {name}\n"),
+                format!("echo 'a\n# b' # git-clown init {name}\n"),
             ] {
                 assert_eq!(rc_state(shell, &content), RcState::Missing, "{content}");
                 assert_eq!(upsert_block(shell, &content).1, InstallOutcome::Added);
@@ -365,6 +399,15 @@ mod tests {
             assert_eq!(rc_state(shell, &trailing), RcState::Manual);
             let in_word = format!("eval \"$(git-clown init {name})\"#x\n");
             assert_eq!(rc_state(shell, &in_word), RcState::Manual);
+            for active in [
+                format!("echo '#'; eval \"$(git-clown init {name})\"\n"),
+                format!("echo \"#\" ; eval \"$(git-clown init {name})\"\n"),
+                format!("echo \\# ; eval \"$(git-clown init {name})\"\n"),
+                format!("echo ${{#PATH}}; eval \"$(git-clown init {name})\"\n"),
+                format!("true;eval \"$(git-clown init {name})\"\n"),
+            ] {
+                assert_eq!(rc_state(shell, &active), RcState::Manual, "{active}");
+            }
         }
     }
 

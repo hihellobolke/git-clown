@@ -345,26 +345,49 @@ fn git_wrapper_works_with_nounset_and_errexit() {
 #[test]
 fn doctor_installs_over_commented_out_setup() {
     for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
-        let sb = Sandbox::new();
-        let rc = sb.home().join(if shell == "zsh" {
-            ".zshrc"
-        } else if cfg!(target_os = "macos") {
-            ".bash_profile"
-        } else {
-            ".bashrc"
-        });
-        let comment = format!("# To install later: eval \"$(git-clown init {shell})\"\n");
-        fs::write(&rc, &comment).unwrap();
+        for comment in [
+            format!("# To install later: eval \"$(git-clown init {shell})\"\n"),
+            format!("true;# eval \"$(git-clown init {shell})\"\n"),
+        ] {
+            let sb = Sandbox::new();
+            let rc = sb.home().join(if shell == "zsh" {
+                ".zshrc"
+            } else if cfg!(target_os = "macos") {
+                ".bash_profile"
+            } else {
+                ".bashrc"
+            });
+            fs::write(&rc, &comment).unwrap();
 
-        let output = sb
-            .command(BIN)
-            .args(["doctor", "--install", "--shell", shell])
-            .output()
-            .unwrap();
-        assert_success(&output);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("Added the"));
-        let content = fs::read_to_string(&rc).unwrap();
-        assert!(content.starts_with(&comment), "{shell}: {content}");
-        assert!(content.contains("# >>> git-clown shell integration >>>"));
+            let output = sb
+                .command(BIN)
+                .args(["doctor", "--install", "--shell", shell])
+                .output()
+                .unwrap();
+            assert_success(&output);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("Added the"), "{shell} {comment}: {stdout}");
+            let content = fs::read_to_string(&rc).unwrap();
+            assert!(content.starts_with(&comment), "{shell}: {content}");
+            assert!(content.contains("# >>> git-clown shell integration >>>"));
+
+            // The installed block, not the comment, gives a fresh shell the wrappers.
+            let probe = if shell == "zsh" {
+                "whence -w git-clown git"
+            } else {
+                "type -t git-clown git"
+            };
+            let output = sb
+                .command(shell)
+                .args(["-i", "-c", probe])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.matches("function").count(),
+                2,
+                "{shell} {comment}: {stdout}"
+            );
+        }
     }
 }

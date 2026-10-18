@@ -27,7 +27,7 @@
 - **THEN** only the block is replaced, and the rest of the file is kept
 
 #### Scenario: Commented-out setup line
-- **GIVEN** the rc file only mentions `git-clown init <shell>` in a comment
+- **GIVEN** the rc file only mentions `git-clown init <shell>` in a comment, whether on its own line or after an operator (`true;# eval "$(git-clown init zsh)"`)
 - **WHEN** the user runs `git-clown doctor --install`
 - **THEN** the rc file counts as not installed and the block is added
 
