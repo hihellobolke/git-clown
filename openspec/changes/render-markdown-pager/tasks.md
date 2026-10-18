@@ -15,7 +15,7 @@
 ## 3. CLI
 
 - [x] 3.1 `--readme` flag with `GIT_CLOWN_README` setting; show the README after any successful clone path
-- [x] 3.2 `run_bare_clone` returns the worktree path so its README can be found
+- [x] 3.2 Show the README from the directory `run_clone` reports (the clone, or the worktree for `--bare`)
 - [x] 3.3 `--docs` flag showing the embedded README; git URL optional with `--docs`
 - [x] 3.4 Document the flags, keys, setting and fallback in `README.md`
 

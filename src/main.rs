@@ -28,23 +28,28 @@
 //! Environment variables:
 //! * `WORKSPACE_ROOT`: The root directory for the workspace. Defaults to `~/ws/` if not set.
 //! * `GIT_CLOWN_README`: Set to `true` to always show the README (same as `--readme`).
+//!
+//! Shell integration (`git-clown doctor --install`, or `eval "$(git-clown init zsh)"`)
+//! makes the shell cd into the cloned repository; see the [`shell`] module.
 
+mod doctor;
 mod markdown;
 mod pager;
+mod shell;
 
 use anyhow::Result;
-use clap::{builder::BoolishValueParser, Parser};
+use clap::{builder::BoolishValueParser, Parser, Subcommand};
 use colored::Colorize;
 use dotenvy;
 use log::{debug, error, info, warn};
 use regex::Regex;
+use shell::Shell;
 use std::{
     collections::HashMap,
     env,
     fs::{self, File},
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command as StdCommand,
 };
 use thiserror::Error;
 use tokio::process::Command;
@@ -87,9 +92,27 @@ enum GitClownError {
 #[command(
     author,
     version,
-    about = "A tool to clone git repos with a structured workspace layout"
+    about = "A tool to clone git repos with a structured workspace layout",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    after_help = "Shell integration: run `git-clown doctor --install` (bash/zsh) so that \
+                  `git clown <url>` also cd's into the cloned repository."
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    clone: CloneArgs,
+
+    /// Show the git-clown documentation in a terminal pager and exit
+    #[arg(long, conflicts_with_all = ["git_url", "bare"])]
+    docs: bool,
+}
+
+/// Arguments for the default clone command
+#[derive(clap::Args, Debug)]
+struct CloneArgs {
     /// The URL of the git repository to clone
     #[arg(required_unless_present = "docs")]
     git_url: Option<String>,
@@ -102,10 +125,6 @@ struct Args {
     /// (printed as plain text when stdout is not a terminal)
     #[arg(long, env = "GIT_CLOWN_README", value_parser = BoolishValueParser::new())]
     readme: bool,
-
-    /// Show the git-clown documentation in a terminal pager and exit
-    #[arg(long, conflicts_with_all = ["git_url", "bare"])]
-    docs: bool,
 }
 
 /// git-clown's own documentation, shown by `--docs`
@@ -113,6 +132,24 @@ const DOCS: &str = include_str!("../README.md");
 
 /// README file names tried, in order, when showing a cloned repository's README
 const README_NAMES: [&str; 4] = ["README.md", "README.markdown", "readme.md", "Readme.md"];
+
+/// Subcommands besides the default clone
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Check git-clown's setup and install the shell integration that cd's into clones
+    Doctor(doctor::DoctorArgs),
+
+    /// Print the shell integration script, e.g. `eval "$(git-clown init zsh)"`
+    Init {
+        /// Shell to print the integration for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Report a directory to the shell wrapper (used by `doctor` to self-test)
+    #[command(name = "__selftest-cd", hide = true)]
+    SelftestCd { dir: PathBuf },
+}
 
 /// Parses a git URL and extracts components needed for directory structure
 ///
@@ -496,6 +533,7 @@ async fn read_env_file(env_file_path: &Path) -> Result<HashMap<String, String>, 
 ///
 /// * `git_url` - The URL of the Git repository to clone
 /// * `dir_path` - The directory path where git clone should be executed (parent directory of the clone)
+/// * `clone_dir` - Name of the directory git clones into, inside `dir_path`
 /// * `env_vars` - Environment variables to pass to the git clone command
 ///
 /// # Returns
@@ -509,6 +547,7 @@ async fn read_env_file(env_file_path: &Path) -> Result<HashMap<String, String>, 
 async fn execute_git_clone(
     git_url: &str,
     dir_path: &Path,
+    clone_dir: &str,
     env_vars: &HashMap<String, String>,
 ) -> Result<std::process::ExitStatus, GitClownError> {
     info!(
@@ -518,7 +557,7 @@ async fn execute_git_clone(
     );
 
     // Create the command with current directory and merged environment applied.
-    let mut command = build_git_command(dir_path, &["clone", git_url], env_vars);
+    let mut command = build_git_command(dir_path, &["clone", git_url, clone_dir], env_vars);
 
     debug!("Running command: {:?}", command);
 
@@ -552,6 +591,22 @@ async fn execute_git_clone(
     }
 
     Ok(output.status)
+}
+
+/// Derives the directory name `git clone <url>` would create, the way git
+/// does: the last path component of the URL without a trailing `/`, `/.git`
+/// or `.git`.
+///
+/// Returns `None` when no usable name can be derived.
+fn clone_dir_name(git_url: &str) -> Option<String> {
+    let trimmed = git_url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/.git").unwrap_or(trimmed);
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    match name {
+        "" | "." | ".." => None,
+        name => Some(name.to_string()),
+    }
 }
 
 /// Builds a git command with a working directory, argument list, and a merged
@@ -592,8 +647,8 @@ async fn get_workspace_root() -> PathBuf {
     debug!("Getting workspace root directory");
 
     // Check for the WORKSPACE_ROOT environment variable first
-    if let Ok(path) = env::var("WORKSPACE_ROOT") {
-        let path_buf = PathBuf::from(path);
+    if env::var_os("WORKSPACE_ROOT").is_some() {
+        let path_buf = workspace_root_path();
         debug!(
             "Using workspace root from WORKSPACE_ROOT environment variable: {}",
             path_buf.display().to_string().cyan()
@@ -601,9 +656,7 @@ async fn get_workspace_root() -> PathBuf {
         return path_buf;
     }
 
-    // Default to ~/ws
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let default_path = home_dir.join("ws");
+    let default_path = workspace_root_path();
     info!(
         "WORKSPACE_ROOT not set, using default: {}",
         default_path.display().to_string().green()
@@ -621,6 +674,17 @@ async fn get_workspace_root() -> PathBuf {
     }
 
     default_path
+}
+
+/// Returns the workspace root (`$WORKSPACE_ROOT`, else `~/ws`) without
+/// creating it.
+fn workspace_root_path() -> PathBuf {
+    match env::var_os("WORKSPACE_ROOT") {
+        Some(path) => PathBuf::from(path),
+        None => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ws"),
+    }
 }
 
 /// Checks if a git repository has already been cloned
@@ -646,9 +710,7 @@ async fn repository_exists(dir_path: &Path, repo_name: &str) -> bool {
     );
 
     if repo_path.exists() && repo_path.is_dir() && git_dir_path.exists() && git_dir_path.is_dir() {
-        debug!(
-            "Repository directory exists and contains .git directory"
-        );
+        debug!("Repository directory exists and contains .git directory");
         return true;
     }
 
@@ -680,10 +742,14 @@ async fn clone_bare(
         bare_path.display().to_string().green()
     );
 
-    let mut command = build_git_command(repo_root, &["clone", "--bare", git_url, ".bare"], env_vars);
+    let mut command =
+        build_git_command(repo_root, &["clone", "--bare", git_url, ".bare"], env_vars);
 
     let output = command.output().await.map_err(|e| {
-        error!("Failed to execute git clone --bare: {}", e.to_string().red());
+        error!(
+            "Failed to execute git clone --bare: {}",
+            e.to_string().red()
+        );
         GitClownError::GitCloneError(e.to_string())
     })?;
 
@@ -740,9 +806,9 @@ async fn fix_refspec_and_fetch(
         ],
         env_vars,
     )
-        .output()
-        .await
-        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+    .output()
+    .await
+    .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
 
     if !output.status.success() {
         return Err(GitClownError::GitCloneError(format!(
@@ -777,10 +843,14 @@ async fn detect_default_branch(
     repo_root: &Path,
     env_vars: &HashMap<String, String>,
 ) -> Result<String, GitClownError> {
-    let output = build_git_command(repo_root, &["-C", ".bare", "symbolic-ref", "HEAD"], env_vars)
-        .output()
-        .await
-        .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
+    let output = build_git_command(
+        repo_root,
+        &["-C", ".bare", "symbolic-ref", "HEAD"],
+        env_vars,
+    )
+    .output()
+    .await
+    .map_err(|e| GitClownError::GitCloneError(e.to_string()))?;
 
     if !output.status.success() {
         return Err(GitClownError::GitCloneError(
@@ -870,7 +940,8 @@ async fn write_vscode_workspace(repo_root: &Path, repo: &str) -> Result<(), GitC
         return Ok(());
     }
 
-    let content = "{\n  \"folders\": [\n    {\n      \"path\": \".\"\n    }\n  ],\n  \"settings\": {}\n}\n";
+    let content =
+        "{\n  \"folders\": [\n    {\n      \"path\": \".\"\n    }\n  ],\n  \"settings\": {}\n}\n";
     fs::write(&workspace_file, content)?;
     info!(
         "VS Code workspace file written at {}",
@@ -909,6 +980,81 @@ async fn run_bare_clone(
         branch.green()
     );
     Ok(repo_root.join(branch))
+}
+
+/// Main clone logic flow
+///
+/// Orchestrates the complete process:
+/// 1. Get workspace root directory
+/// 2. Parse git URL
+/// 3. Create directory structure
+/// 4. Find environment file
+/// 5. Load environment variables
+///    6a. If `--bare`: run bare clone + worktree workflow
+///    6b. Otherwise: check if repository already exists, then execute git clone
+/// 7. On success, report the repository directory to the shell integration
+/// 8. On success with `readme`, show the repository's README in the pager
+///
+/// # Returns
+///
+/// The exit code of the git clone command (0 when nothing needed cloning)
+///
+/// # Errors
+///
+/// Various GitClownError types depending on which step fails
+async fn run_clone(git_url: &str, bare: bool, readme: bool) -> Result<i32, GitClownError> {
+    debug!("Starting git-clown");
+    info!("Git URL: {}", git_url.green());
+
+    // Get workspace root
+    let workspace_root = get_workspace_root().await;
+
+    // Parse git URL
+    let (host, org, repo) = parse_git_url(git_url).await?;
+
+    // Create directory structure (<workspace>/<host>/<org>)
+    let dir_path = create_directory_structure(&workspace_root, &host, &org).await?;
+
+    // Current environment, overridden by the nearest .envrc/.env if any
+    let base_env_vars: HashMap<String, String> = env::vars().collect();
+    let env_vars = match find_env_file(&dir_path, &workspace_root).await? {
+        Some(env_file_path) => merge_env_vars(base_env_vars, read_env_file(&env_file_path).await?),
+        None => {
+            warn!("No environment file found, proceeding with system environment only");
+            base_env_vars
+        }
+    };
+
+    let (code, repo_dir) = if bare {
+        // Bare clone path: set up bare repo + worktree
+        let worktree =
+            run_bare_clone(git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
+        (0, worktree)
+    } else {
+        // Name the clone directory explicitly, as git would, so the directory
+        // reported afterwards is exactly the one git created (nested
+        // namespaces like org/subgroup/repo clone into <org>/repo).
+        let clone_dir = clone_dir_name(git_url).unwrap_or_else(|| repo.clone());
+        if repository_exists(&dir_path, &clone_dir).await {
+            info!(
+                "Repository {} already exists, skipping git clone",
+                clone_dir.green()
+            );
+            (0, dir_path.join(&clone_dir))
+        } else {
+            // Execute git clone with environment variables
+            let status = execute_git_clone(git_url, &dir_path, &clone_dir, &env_vars).await?;
+            (status.code().unwrap_or(1), dir_path.join(&clone_dir))
+        }
+    };
+
+    if code == 0 {
+        report_repo_dir(&repo_dir);
+        if readme {
+            show_readme(&workspace_root, &repo_dir).await;
+        }
+    }
+    Ok(code)
 }
 
 /// Finds a markdown README at the top of a checkout.
@@ -958,100 +1104,62 @@ async fn show_readme(workspace_root: &Path, checkout: &Path) {
     }
 }
 
-/// Returns a successful exit status in a cross-platform way.
-fn success_status() -> Result<std::process::ExitStatus, GitClownError> {
-    StdCommand::new("true")
-        .status()
-        .map_err(GitClownError::IoError)
+/// Handles `--docs`: shows git-clown's own README in the pager.
+fn run_docs() -> i32 {
+    match pager::show("git-clown", DOCS) {
+        Ok(()) => 0,
+        Err(e) => {
+            error!("Failed to show the documentation: {}", e.to_string().red());
+            1
+        }
+    }
 }
 
-/// Main application logic flow
-///
-/// Orchestrates the complete process:
-/// 1. Parse command line arguments (with `--docs`, show the docs and stop)
-/// 2. Get workspace root directory
-/// 3. Parse git URL
-/// 4. Create directory structure
-/// 5. Find environment file
-/// 6. Load environment variables
-///    7a. If `--bare`: run bare clone + worktree workflow
-///    7b. Otherwise: check if repository already exists, then execute git clone
-/// 8. If `--readme` and the clone succeeded: show the README in the pager
-///
-/// # Returns
-///
-/// The exit status of the git clone command
-///
-/// # Errors
-///
-/// Various GitClownError types depending on which step fails
-async fn run() -> Result<std::process::ExitStatus, GitClownError> {
-    debug!("Starting git-clown");
-
-    // Parse command-line arguments
-    let args = Args::parse();
-    if args.docs {
-        show_markdown("git-clown".to_string(), DOCS.to_string()).await?;
-        return success_status();
+/// Tells the user where the repository is and hands the directory to the
+/// shell integration (if active) so the shell can cd into it.
+fn report_repo_dir(repo_dir: &Path) {
+    info!(
+        "Repository is at {}",
+        repo_dir.display().to_string().green()
+    );
+    match shell::write_cd_target(repo_dir) {
+        Ok(true) => debug!("Reported directory to the shell integration"),
+        Ok(false) => info!(
+            "Tip: run {} so `git clown` also cd's into the repository",
+            "git-clown doctor --install".cyan()
+        ),
+        Err(e) => warn!(
+            "Could not report the directory to the shell integration: {}",
+            e.to_string().yellow()
+        ),
     }
-    let git_url = args
-        .git_url
-        .expect("clap requires git_url unless --docs is given");
-    info!("Git URL: {}", git_url.green());
+}
 
-    // Get workspace root
-    let workspace_root = get_workspace_root().await;
-
-    // Parse git URL
-    let (host, org, repo) = parse_git_url(&git_url).await?;
-
-    // Create directory structure (<workspace>/<host>/<org>)
-    let dir_path = create_directory_structure(&workspace_root, &host, &org).await?;
-
-    // Find environment file
-    let env_file = find_env_file(&dir_path, &workspace_root).await?;
-
-    // Get current environment as baseline, overridden by the environment file if any
-    let base_env_vars: HashMap<String, String> = env::vars().collect();
-    let env_vars = match env_file {
-        Some(env_file_path) => merge_env_vars(base_env_vars, read_env_file(&env_file_path).await?),
-        None => {
-            warn!("No environment file found, proceeding with system environment only");
-            base_env_vars
+/// Handles the hidden `__selftest-cd` subcommand: reports `dir` to the shell
+/// wrapper exactly like a successful clone would.
+fn run_selftest_cd(dir: &Path) -> i32 {
+    match shell::write_cd_target(dir) {
+        Ok(true) => 0,
+        Ok(false) => {
+            eprintln!(
+                "{} is not set; run this through the shell integration",
+                shell::CD_FILE_ENV
+            );
+            1
         }
-    };
-
-    let (status, checkout) = if args.bare {
-        // Bare clone path: set up bare repo + worktree
-        let worktree =
-            run_bare_clone(&git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
-        (success_status()?, worktree)
-    } else if repository_exists(&dir_path, &repo).await {
-        info!(
-            "Repository {} already exists, skipping git clone",
-            repo.green()
-        );
-        (success_status()?, dir_path.join(&repo))
-    } else {
-        // Execute git clone with environment variables
-        let status = execute_git_clone(&git_url, &dir_path, &env_vars).await?;
-        (status, dir_path.join(&repo))
-    };
-
-    if args.readme && status.success() {
-        show_readme(&workspace_root, &checkout).await;
+        Err(e) => {
+            eprintln!("Failed to write cd target: {e}");
+            1
+        }
     }
-
-    Ok(status)
 }
 
 /// Application entry point
 ///
 /// Sets up:
 /// 1. Colored logging with env_logger
-/// 2. Tokio async runtime
-/// 3. Runs the main application logic
-/// 4. Handles exit status and errors
+/// 2. Dispatches to a subcommand, or to the clone flow on a Tokio runtime
+/// 3. Handles exit status and errors
 ///
 /// # Returns
 ///
@@ -1062,31 +1170,42 @@ fn main() -> Result<()> {
         .format_timestamp(None)
         .init();
 
-    // Create async runtime
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-
-    // Run our async main in the runtime
-    let result = runtime.block_on(run());
-
-    match result {
-        Ok(status) => {
-            info!(
-                "Git-clown completed with status code: {}",
-                status.code().unwrap_or(0)
-            );
-            std::process::exit(status.code().unwrap_or(0));
+    let cli = Cli::parse();
+    let code = match cli.command {
+        Some(Commands::Doctor(args)) => doctor::run(&args),
+        Some(Commands::Init { shell }) => {
+            print!("{}", shell.init_script());
+            0
         }
-        Err(e) => {
-            error!("Error: {}", e.to_string().red());
-            std::process::exit(1);
+        Some(Commands::SelftestCd { dir }) => run_selftest_cd(&dir),
+        None if cli.docs => run_docs(),
+        None => {
+            // clap enforces the URL when no subcommand is given
+            let git_url = cli.clone.git_url.unwrap_or_default();
+
+            // Create async runtime and run the clone flow in it
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let clone = run_clone(&git_url, cli.clone.bare, cli.clone.readme);
+            match runtime.block_on(clone) {
+                Ok(code) => {
+                    info!("Git-clown completed with status code: {}", code);
+                    code
+                }
+                Err(e) => {
+                    error!("Error: {}", e.to_string().red());
+                    1
+                }
+            }
         }
-    }
+    };
+    std::process::exit(code);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1123,6 +1242,22 @@ mod tests {
     async fn test_parse_git_url_invalid() {
         let result = parse_git_url("not-a-url").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_clone_dir_name() {
+        let cases = [
+            ("https://github.com/example/repo.git", Some("repo")),
+            ("https://github.com/example/repo", Some("repo")),
+            ("https://github.com/example/repo/", Some("repo")),
+            ("https://gitlab.com/org/subgroup/repo.git", Some("repo")),
+            ("https://example.com/org/repo/.git", Some("repo")),
+            ("git@github.com:example/repo.git", Some("repo")),
+            ("git@host:repo.git", Some("repo")),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(clone_dir_name(url).as_deref(), expected, "{url}");
+        }
     }
 
     #[tokio::test]
@@ -1257,25 +1392,25 @@ mod tests {
     async fn test_repository_exists() {
         let temp_dir = tempdir().unwrap();
         let parent_dir = temp_dir.path();
-        
+
         // Create a fake repository with a .git directory
         let repo_name = "test-repo";
         let repo_dir = parent_dir.join(repo_name);
         let git_dir = repo_dir.join(".git");
-        
+
         fs::create_dir_all(&git_dir).unwrap();
-        
+
         // Test that repository is detected
         assert!(repository_exists(parent_dir, repo_name).await);
-        
+
         // Test that non-existent repository is not detected
         assert!(!repository_exists(parent_dir, "nonexistent-repo").await);
-        
+
         // Test that a directory without .git is not detected as repository
         let not_repo_name = "not-a-repo";
         let not_repo_dir = parent_dir.join(not_repo_name);
         fs::create_dir_all(&not_repo_dir).unwrap();
-        
+
         assert!(!repository_exists(parent_dir, not_repo_name).await);
     }
 
@@ -1377,20 +1512,29 @@ mod tests {
         );
 
         // .bare directory exists
-        assert!(repo_root.join(".bare").is_dir(), ".bare should be a directory");
+        assert!(
+            repo_root.join(".bare").is_dir(),
+            ".bare should be a directory"
+        );
 
         // .git pointer file has correct content
         let git_content = fs::read_to_string(repo_root.join(".git")).unwrap();
         assert_eq!(git_content.trim(), "gitdir: ./.bare");
 
         // worktree for default branch exists
-        assert!(repo_root.join("main").is_dir(), "main worktree should exist");
+        assert!(
+            repo_root.join("main").is_dir(),
+            "main worktree should exist"
+        );
 
         // .code-workspace file exists with expected content
         let ws_file = repo_root.join("myrepo.code-workspace");
         assert!(ws_file.exists(), ".code-workspace file should exist");
         let ws_content = fs::read_to_string(&ws_file).unwrap();
-        assert!(ws_content.contains("\"path\": \".\""), "workspace file should reference '.'");
+        assert!(
+            ws_content.contains("\"path\": \".\""),
+            "workspace file should reference '.'"
+        );
     }
 
     #[test]
@@ -1441,7 +1585,10 @@ mod tests {
         .unwrap();
 
         let trace = fs::read_to_string(&trace_file).unwrap();
-        assert!(trace.contains(" fetch"), "trace should include git fetch invocation");
+        assert!(
+            trace.contains(" fetch"),
+            "trace should include git fetch invocation"
+        );
         assert!(
             trace.contains(" symbolic-ref HEAD"),
             "trace should include git symbolic-ref invocation"
@@ -1453,29 +1600,31 @@ mod tests {
     }
 
     #[test]
-    fn test_args_docs_needs_no_url() {
-        let args = Args::try_parse_from(["git-clown", "--docs"]).unwrap();
-        assert!(args.docs);
-        assert!(args.git_url.is_none());
+    fn test_cli_docs_needs_no_url() {
+        let cli = Cli::try_parse_from(["git-clown", "--docs"]).unwrap();
+        assert!(cli.docs);
+        assert!(cli.command.is_none());
+        assert!(cli.clone.git_url.is_none());
     }
 
     #[test]
-    fn test_args_url_required_without_docs() {
-        assert!(Args::try_parse_from(["git-clown"]).is_err());
-        assert!(Args::try_parse_from(["git-clown", "--readme"]).is_err());
+    fn test_cli_url_required_without_docs() {
+        assert!(Cli::try_parse_from(["git-clown"]).is_err());
+        assert!(Cli::try_parse_from(["git-clown", "--readme"]).is_err());
     }
 
     #[test]
-    fn test_args_docs_conflicts_with_clone_options() {
-        assert!(Args::try_parse_from(["git-clown", "--docs", "https://h/o/r"]).is_err());
-        assert!(Args::try_parse_from(["git-clown", "--docs", "--bare"]).is_err());
+    fn test_cli_docs_conflicts_with_clone_options() {
+        assert!(Cli::try_parse_from(["git-clown", "--docs", "https://h/o/r"]).is_err());
+        assert!(Cli::try_parse_from(["git-clown", "--docs", "--bare"]).is_err());
+        assert!(Cli::try_parse_from(["git-clown", "--docs", "doctor"]).is_err());
     }
 
     #[test]
-    fn test_args_readme_flag() {
-        let args = Args::try_parse_from(["git-clown", "--readme", "https://h/o/r"]).unwrap();
-        assert!(args.readme);
-        assert_eq!(args.git_url.as_deref(), Some("https://h/o/r"));
+    fn test_cli_readme_flag() {
+        let cli = Cli::try_parse_from(["git-clown", "--readme", "https://h/o/r"]).unwrap();
+        assert!(cli.clone.readme);
+        assert_eq!(cli.clone.git_url.as_deref(), Some("https://h/o/r"));
     }
 
     #[test]

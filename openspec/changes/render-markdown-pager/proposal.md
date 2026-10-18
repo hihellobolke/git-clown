@@ -23,7 +23,7 @@ After cloning, the first thing a developer usually does is read the repository's
 ## Impact
 
 - **New modules**: `src/markdown.rs` (pulldown-cmark events to wrapped ratatui lines) and `src/pager.rs` (ratatui + crossterm pager, plain fallback).
-- **`src/main.rs`**: new CLI flags; `run()` deduplicated so the README step runs once after any successful clone path; `run_bare_clone` returns the worktree path.
+- **`src/main.rs`**: `--readme` on the clone arguments and `--docs` on the top-level CLI (next to the `doctor` and `init` subcommands); after a successful clone, the README is shown right after the directory is reported to the shell integration.
 - **New dependencies**: `pulldown-cmark` (no default features), `ratatui` (crossterm backend only), `crossterm`, `unicode-width`; clap gains the `env` feature.
 - **No breaking changes**: without the flags (or the variable) behaviour is unchanged. `git-clown` with no arguments still fails with the same "required arguments were not provided: <GIT_URL>" error.
 - **Rollback plan**: revert the change; the flags and variable disappear and no files or config are left behind.
