@@ -21,6 +21,12 @@ use std::{
 /// Key help shown in the status bar.
 const KEY_HELP: &str = "q quit · ↑↓ j k scroll · space b page · g G top/end";
 
+/// Status bar hint shown when some lines are wider than the screen.
+const SIDE_SCROLL_HELP: &str = "←→ h l: more to the side";
+
+/// Columns moved by one sideways scroll step.
+const SIDE_STEP: usize = 8;
+
 /// Shows `markdown` in the pager, or prints it unchanged when stdout is not an
 /// interactive terminal.
 ///
@@ -79,6 +85,10 @@ struct Pager {
     height: usize,
     /// Index of the first line shown.
     offset: usize,
+    /// Columns the widest line overflows the screen by.
+    overflow: usize,
+    /// Index of the first column shown.
+    column: usize,
 }
 
 impl Pager {
@@ -90,6 +100,8 @@ impl Pager {
             width: None,
             height: 0,
             offset: 0,
+            overflow: 0,
+            column: 0,
         }
     }
 
@@ -98,9 +110,12 @@ impl Pager {
         if self.width != Some(width) {
             self.lines = markdown::render(&self.markdown, width);
             self.width = Some(width);
+            let widest = self.lines.iter().map(Line::width).max().unwrap_or(0);
+            self.overflow = widest.saturating_sub(usize::from(width));
         }
         self.height = usize::from(height);
         self.offset = self.offset.min(self.max_offset());
+        self.column = self.column.min(self.overflow);
     }
 
     fn max_offset(&self) -> usize {
@@ -130,6 +145,12 @@ impl Pager {
             KeyCode::Char('u') => self.scroll_up(page / 2),
             KeyCode::Home | KeyCode::Char('g') => self.offset = 0,
             KeyCode::End | KeyCode::Char('G') => self.offset = self.max_offset(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.column = self.column.saturating_sub(SIDE_STEP)
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.column = (self.column + SIDE_STEP).min(self.overflow)
+            }
             _ => {}
         }
         true
@@ -143,7 +164,8 @@ impl Pager {
 
         let end = (self.offset + self.height).min(self.lines.len());
         let visible = self.lines[self.offset..end].to_vec();
-        frame.render_widget(Paragraph::new(visible), body);
+        let column = u16::try_from(self.column).unwrap_or(u16::MAX);
+        frame.render_widget(Paragraph::new(visible).scroll((0, column)), body);
         frame.render_widget(Paragraph::new(self.status_line(end)), status);
     }
 
@@ -157,15 +179,22 @@ impl Pager {
             total
         );
         let bar = Style::new().add_modifier(Modifier::REVERSED);
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!(" {} ", self.title),
                 bar.add_modifier(Modifier::BOLD),
             ),
             Span::styled(position, bar),
-            Span::styled(format!(" {KEY_HELP} "), bar),
-        ])
-        .style(bar)
+        ];
+        // Placed before the key help so that it is not cut off on narrow screens.
+        if self.overflow > 0 {
+            spans.push(Span::styled(
+                format!(" {SIDE_SCROLL_HELP} "),
+                bar.add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(format!(" {KEY_HELP} "), bar));
+        Line::from(spans).style(bar)
     }
 }
 
@@ -232,6 +261,69 @@ mod tests {
         assert_eq!(pager.offset, 0);
         pager.resize(4, 30);
         assert!(pager.lines.len() > 19, "narrow width should wrap lines");
+    }
+
+    #[test]
+    fn test_pager_scrolls_sideways_only_when_lines_overflow() {
+        let mut pager = pager(3, 5);
+        assert_eq!(pager.overflow, 0);
+        press(&mut pager, KeyCode::Right);
+        assert_eq!(pager.column, 0);
+
+        // Text wraps, but a table with more columns than fit cannot.
+        let wide = format!("|{}\n|{}", "a|".repeat(15), "-|".repeat(15));
+        let mut pager = Pager::new("doc", &wide);
+        pager.resize(20, 5);
+        assert!(pager.overflow > 0);
+        press(&mut pager, KeyCode::Char('l'));
+        assert_eq!(pager.column, SIDE_STEP.min(pager.overflow));
+        for _ in 0..20 {
+            press(&mut pager, KeyCode::Right);
+        }
+        assert_eq!(pager.column, pager.overflow);
+        press(&mut pager, KeyCode::Left);
+        assert_eq!(pager.column, pager.overflow - SIDE_STEP.min(pager.overflow));
+        for _ in 0..20 {
+            press(&mut pager, KeyCode::Char('h'));
+        }
+        assert_eq!(pager.column, 0);
+
+        // Widening the screen removes the overflow and resets the column.
+        press(&mut pager, KeyCode::End);
+        press(&mut pager, KeyCode::Right);
+        pager.resize(200, 5);
+        assert_eq!((pager.overflow, pager.column), (0, 0));
+    }
+
+    #[test]
+    fn test_pager_draws_overflowing_lines_scrolled_sideways() {
+        let wide = format!("|{}\n|{}", "ab|".repeat(15), "-|".repeat(15));
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        let mut pager = Pager::new("doc", &wide);
+        terminal.draw(|frame| pager.draw(frame)).unwrap();
+        let row = |terminal: &Terminal<TestBackend>, y: u16| -> String {
+            let buffer = terminal.backend().buffer();
+            (0..30).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+        // Squeezed to one column each, the cells wrap onto two lines.
+        assert!(row(&terminal, 0).starts_with("a │ a │ a"));
+        assert!(row(&terminal, 1).starts_with("b │ b │ b"));
+        assert!(
+            row(&terminal, 3).contains("←→ h l"),
+            "{}",
+            row(&terminal, 3)
+        );
+
+        pager.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        for _ in 0..20 {
+            pager.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| pager.draw(frame)).unwrap();
+        assert!(
+            row(&terminal, 0).trim_end().ends_with("a │ a"),
+            "{}",
+            row(&terminal, 0)
+        );
     }
 
     #[test]

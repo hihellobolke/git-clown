@@ -19,6 +19,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// (unless the screen itself is narrower).
 const MIN_TEXT_WIDTH: usize = 8;
 
+/// Drawn between table columns.
+const TABLE_SEPARATOR: &str = " │ ";
+
 /// Bullets for unordered lists, by nesting depth.
 const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
 
@@ -444,9 +447,11 @@ impl Renderer {
         }
     }
 
+    /// Lays out a table, shrinking its widest columns and wrapping their cells
+    /// when its rows would not fit the width.
     fn push_table(&mut self, table: Table) {
         let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-        let widths: Vec<usize> = (0..columns)
+        let natural: Vec<usize> = (0..columns)
             .map(|column| {
                 table
                     .rows
@@ -457,25 +462,35 @@ impl Renderer {
                     .unwrap_or(0)
             })
             .collect();
-        let separator = Span::styled(" │ ", dim_style());
+        let separator = Span::styled(TABLE_SEPARATOR, dim_style());
+        let separators = TABLE_SEPARATOR.width() * columns.saturating_sub(1);
+        let widths = fit_columns(&natural, self.text_width().saturating_sub(separators));
         for (index, row) in table.rows.into_iter().enumerate() {
-            let mut line = self.first_prefix();
-            for (column, width) in widths.iter().enumerate() {
-                if column > 0 {
-                    line.push(separator.clone());
+            let cells: Vec<Vec<Vec<Span<'static>>>> = widths
+                .iter()
+                .enumerate()
+                .map(|(column, width)| wrap(row.get(column).map_or(&[], Vec::as_slice), *width))
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for row_line in 0..height {
+                let mut line = self.first_prefix();
+                for (column, width) in widths.iter().enumerate() {
+                    if column > 0 {
+                        line.push(separator.clone());
+                    }
+                    let cell = cells[column].get(row_line).cloned().unwrap_or_default();
+                    let padding = width.saturating_sub(cell.iter().map(Span::width).sum());
+                    let (left, right) = match table.alignments.get(column) {
+                        Some(Alignment::Right) => (padding, 0),
+                        Some(Alignment::Center) => (padding / 2, padding - padding / 2),
+                        _ => (0, padding),
+                    };
+                    line.push(Span::raw(" ".repeat(left)));
+                    line.extend(cell);
+                    line.push(Span::raw(" ".repeat(right)));
                 }
-                let cell = row.get(column).cloned().unwrap_or_default();
-                let padding = width - cell.iter().map(Span::width).sum::<usize>();
-                let (left, right) = match table.alignments.get(column) {
-                    Some(Alignment::Right) => (padding, 0),
-                    Some(Alignment::Center) => (padding / 2, padding - padding / 2),
-                    _ => (0, padding),
-                };
-                line.push(Span::raw(" ".repeat(left)));
-                line.extend(cell);
-                line.push(Span::raw(" ".repeat(right)));
+                self.lines.push(Line::from(line));
             }
-            self.lines.push(Line::from(line));
             if index + 1 == table.header_rows {
                 let mut rule = self.prefix(false);
                 let cells: Vec<String> = widths.iter().map(|width| "─".repeat(*width)).collect();
@@ -484,6 +499,28 @@ impl Renderer {
             }
         }
     }
+}
+
+/// Column widths for a table whose columns naturally take `natural` columns,
+/// within `available` columns.
+///
+/// Columns narrower than an even share of the space keep their width; the
+/// space they leave is shared among the wider ones. Every column gets at least
+/// one column, so a table with very many columns can still be too wide.
+fn fit_columns(natural: &[usize], available: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= available {
+        return natural.to_vec();
+    }
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by_key(|&column| natural[column]);
+    let mut widths = vec![0; natural.len()];
+    let mut remaining = available;
+    for (done, &column) in order.iter().enumerate() {
+        let share = (remaining / (natural.len() - done)).max(1);
+        widths[column] = natural[column].min(share);
+        remaining = remaining.saturating_sub(widths[column]);
+    }
+    widths
 }
 
 /// A run of spans that is either whitespace or a word (which may mix styles).
@@ -760,6 +797,39 @@ mod tests {
     }
 
     #[test]
+    fn test_render_wide_table_wraps_cells_to_fit() {
+        let markdown = "| Option | Description |\n|---|---|\n\
+            | `--readme` | This table cell has a long explanation that should remain \
+            readable at an eighty column terminal. TABLE_END_VISIBLE |\n\n\
+            After the table.";
+        let lines = render(markdown, 80);
+        for line in &lines {
+            assert!(line.width() <= 80, "{line:?} wider than 80");
+        }
+        let text = texts(&lines);
+        assert_eq!(text[0].trim_end(), "Option   │ Description");
+        assert!(
+            text[2].starts_with("--readme │ This table cell"),
+            "{text:?}"
+        );
+        assert!(text[3].starts_with("         │ "), "{text:?}");
+        let table_text = text[..text.len() - 2].join(" ");
+        assert!(table_text.contains("TABLE_END_VISIBLE"), "{text:?}");
+        assert_eq!(text.last().unwrap(), "After the table.");
+    }
+
+    #[test]
+    fn test_fit_columns() {
+        // Fits: unchanged.
+        assert_eq!(fit_columns(&[3, 10], 20), [3, 10]);
+        // Narrow columns keep their width; the wide ones share the rest.
+        assert_eq!(fit_columns(&[3, 50, 40], 33), [3, 15, 15]);
+        assert_eq!(fit_columns(&[3, 50, 10], 33), [3, 20, 10]);
+        // No room at all: one column each.
+        assert_eq!(fit_columns(&[5, 5, 5], 0), [1, 1, 1]);
+    }
+
+    #[test]
     fn test_render_table_in_list_item_shows_marker_once() {
         let lines = render("- | a |\n  |---|\n  | b |", 40);
         assert_eq!(texts(&lines), ["• a", "  ─", "  b"]);
@@ -845,7 +915,8 @@ mod tests {
             Some text with averyveryverylongwordthatcannotfitanywhere in it.\n\n\
             - item with `code spans` and **bold words** going on and on\n\n\
             > quoted text that wraps\n\n\
-            ```\nlet x = \"a long line of code that must be broken somewhere\";\n```\n";
+            ```\nlet x = \"a long line of code that must be broken somewhere\";\n```\n\n\
+            | key | a long description of the key that goes on |\n|---|:-:|\n| k | v |\n";
         for width in [12u16, 20, 33, 80] {
             for line in render(markdown, width) {
                 assert!(

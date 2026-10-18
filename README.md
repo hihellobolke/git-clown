@@ -75,7 +75,7 @@ Add `--readme` to read the repository's README right after cloning:
 git-clown --readme https://github.com/example/repo.git
 ```
 
-Once the clone succeeds (or the repository turns out to be cloned already), the README opens in a full-screen pager with headings, emphasis, lists, code blocks, tables and links formatted for the terminal. With `--bare`, the README of the default branch worktree is shown. If the repository has no `README.md` (or `README.markdown`), a warning is logged and nothing else happens. A failed clone never opens the pager.
+Once the clone succeeds (or the repository turns out to be cloned already), the README opens in a full-screen pager with headings, emphasis, lists, code blocks, tables and links formatted for the terminal. Text is wrapped to the terminal width, table cells included; only a table with more columns than the screen can hold is wider, and then you can scroll sideways. With `--bare`, the README of the default branch worktree is shown. If the repository has no `README.md` (or `README.markdown`), a warning is logged and nothing else happens. A failed clone never opens the pager.
 
 To read git-clown's own documentation (this file) the same way:
 
@@ -92,6 +92,7 @@ Keys in the pager:
 | `Space`, `f`, `PageDown` / `b`, `PageUp` | Scroll one page down / up |
 | `d` / `u` | Scroll half a page down / up |
 | `g`, `Home` / `G`, `End` | Go to the top / end |
+| `←`, `h` / `→`, `l` | Scroll sideways, when the status bar says there is more to the side |
 
 The pager is only used when stdout is a terminal. When the output is piped or redirected (or `TERM=dumb`), the markdown is printed unchanged instead, so `git-clown --docs | less` or `git-clown --docs > git-clown.md` work as expected.
 

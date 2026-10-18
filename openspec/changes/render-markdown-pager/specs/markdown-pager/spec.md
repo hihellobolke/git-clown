@@ -62,6 +62,17 @@ The pager SHALL render headings, emphasis, inline code, code blocks, lists, task
 - **WHEN** the terminal is resized
 - **THEN** the document SHALL be re-wrapped to the new width
 
+#### Scenario: Wide table
+- **GIVEN** a README table whose rows are wider than the terminal
+- **WHEN** it is rendered
+- **THEN** its widest columns SHALL be narrowed and their cells wrapped onto several lines, so that every cell's text is visible
+
+#### Scenario: Content that cannot fit
+- **GIVEN** a line that cannot be wrapped to the terminal width (a table with more columns than fit)
+- **WHEN** the pager shows it
+- **THEN** the status bar SHALL say there is more to the side
+- **THEN** `←`/`h` and `→`/`l` SHALL scroll sideways until the end of the widest line is visible
+
 #### Scenario: Untrusted content
 - **GIVEN** a README containing escape or other control characters
 - **WHEN** it is rendered

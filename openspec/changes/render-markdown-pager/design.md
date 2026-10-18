@@ -19,6 +19,10 @@ git-clown is a single-binary CLI in `src/main.rs`. It has no subcommands: the gi
 
 The renderer takes the screen width and word-wraps each block itself, so continuation lines keep their list indentation, quote bar or code gutter. The pager re-renders when the width changes. This also gives an exact line count for scroll bounds without ratatui's unstable `rendered-line-info` feature.
 
+### D1a — Tables shrink their widest columns
+
+A table wider than the screen keeps its narrow columns and shares the rest of the width among the wide ones; cells are wrapped within their column, so a row may take several lines. Only a table with more columns than the width can hold (one column per cell plus separators) stays too wide; for that the pager scrolls sideways (`←`/`h`, `→`/`l`) and says so in its status bar, so no content is ever out of reach.
+
 ### D2 — Plain fallback prints the markdown source
 
 When stdout is not a terminal, the original markdown is written unchanged: it is already plain text, it is what tools downstream expect, and it is lossless.
