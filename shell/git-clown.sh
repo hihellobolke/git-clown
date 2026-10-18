@@ -6,32 +6,38 @@
 # so these functions run git-clown with GIT_CLOWN_CD_FILE pointing at a temp
 # file. On success git-clown writes the cloned directory there and the
 # function cd's into it. Normal stdout/stderr output is left untouched.
+#
+# The functions work with `set -u` and `set -e`: arguments are expanded as
+# ${1+"$@"} (safe for an empty list, also in bash 3.2) and every variable is
+# initialized before use.
 
 function git-clown {
-  local __gc_file __gc_status __gc_dir
+  local __gc_file= __gc_status=0 __gc_dir=
   __gc_file="$(mktemp "${TMPDIR:-/tmp}/git-clown-cd.XXXXXX")" || {
-    command git-clown "$@"
+    command git-clown ${1+"$@"}
     return
   }
-  GIT_CLOWN_CD_FILE="$__gc_file" GIT_CLOWN_SHELL=__GIT_CLOWN_SHELL__ command git-clown "$@"
-  __gc_status=$?
+  GIT_CLOWN_CD_FILE="$__gc_file" GIT_CLOWN_SHELL=__GIT_CLOWN_SHELL__ \
+    command git-clown ${1+"$@"} || __gc_status=$?
   if [ "$__gc_status" -eq 0 ] && [ -s "$__gc_file" ]; then
-    IFS= read -r __gc_dir < "$__gc_file"
+    # The file holds the exact path with no terminator. The trailing "x"
+    # keeps command substitution from stripping newlines that are part of it.
+    __gc_dir="$(command cat -- "$__gc_file" && printf x)" && __gc_dir="${__gc_dir%x}" || __gc_dir=
     if [ -n "$__gc_dir" ] && [ -d "$__gc_dir" ]; then
       cd -- "$__gc_dir" || __gc_status=$?
     fi
   fi
-  rm -f -- "$__gc_file"
+  command rm -f -- "$__gc_file"
   return "$__gc_status"
 }
 
 # Route `git clown ...` through the function above; everything else goes
 # straight to the real git.
 function git {
-  if [ "$1" = "clown" ]; then
+  if [ "${1-}" = "clown" ]; then
     shift
-    git-clown "$@"
+    git-clown ${1+"$@"}
   else
-    command git "$@"
+    command git ${1+"$@"}
   fi
 }

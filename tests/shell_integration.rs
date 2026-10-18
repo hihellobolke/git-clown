@@ -13,8 +13,9 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git-clown");
 
-/// A sandbox with a source repo reachable as `https://example.test/org/repo.git`
-/// (through git's `insteadOf`), an empty workspace root and a fake `$HOME`.
+/// A sandbox with source repos reachable as `https://example.test/org/repo.git`
+/// and `https://example.test/org/subgroup/repo.git` (through git's
+/// `insteadOf`), an empty workspace root and a fake `$HOME`.
 struct Sandbox {
     dir: TempDir,
 }
@@ -23,7 +24,15 @@ impl Sandbox {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = Sandbox { dir };
-        let source = sandbox.root().join("src/org/repo.git");
+        sandbox.add_source("org/repo.git");
+        sandbox.add_source("org/subgroup/repo.git");
+        fs::create_dir_all(sandbox.home()).unwrap();
+        sandbox
+    }
+
+    /// Creates a repo with one commit at `src/<rel>`.
+    fn add_source(&self, rel: &str) {
+        let source = self.root().join("src").join(rel);
         fs::create_dir_all(&source).unwrap();
         let git = |args: &[&str]| {
             let status = Command::new("git")
@@ -45,8 +54,6 @@ impl Sandbox {
             "-m",
             "init",
         ]);
-        fs::create_dir_all(sandbox.home()).unwrap();
-        sandbox
     }
 
     fn root(&self) -> PathBuf {
@@ -268,4 +275,96 @@ fn doctor_reports_active_session_through_wrapper() {
     let output = sb.run_in_shell("bash", "git clown doctor --shell bash");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("integration loaded (bash)"), "{stdout}");
+}
+
+#[test]
+fn nested_namespace_clone_changes_into_cloned_repo() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        let sb = Sandbox::new();
+        // git names the clone after the last path segment, inside <org>.
+        let repo = sb.workspace().join("example.test/org/repo");
+        let output = sb.run_in_shell(
+            shell,
+            "git clown https://example.test/org/subgroup/repo.git >/dev/null 2>&1 || exit 1\npwd\n\
+             cd / && git clown https://example.test/org/subgroup/repo.git >/dev/null 2>&1 || exit 1\npwd",
+        );
+        assert_success(&output);
+        assert_eq!(
+            stdout_lines(&output),
+            vec![repo.display().to_string(); 2],
+            "{shell}"
+        );
+        assert!(repo.join(".git").is_dir(), "{shell}");
+    }
+}
+
+#[test]
+fn workspace_path_with_newline_changes_directory() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        let sb = Sandbox::new();
+        let output = sb.run_in_shell(
+            shell,
+            "export WORKSPACE_ROOT=\"$PWD/new\nline\n\"\n\
+             git clown https://example.test/org/repo.git >/dev/null 2>&1 || exit 1\n\
+             [ \"$PWD\" = \"$WORKSPACE_ROOT/example.test/org/repo\" ] && echo same-dir",
+        );
+        assert_success(&output);
+        assert_eq!(stdout_lines(&output), vec!["same-dir"], "{shell}");
+    }
+}
+
+#[test]
+fn git_wrapper_works_with_nounset_and_errexit() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        let sb = Sandbox::new();
+        // `git` with no arguments exits 1; it must not trip `set -u`.
+        let output = sb.run_in_shell(
+            shell,
+            "set -u\n\
+             git >/dev/null 2>&1\necho \"no-args=$?\"\n\
+             git-clown >/dev/null 2>&1\necho \"clown-no-args=$?\"\n\
+             set -e\n\
+             git clown https://example.test/org/repo.git >/dev/null 2>&1\npwd",
+        );
+        assert_success(&output);
+        assert_eq!(
+            stdout_lines(&output),
+            vec![
+                "no-args=1".to_string(),
+                "clown-no-args=2".to_string(),
+                sb.workspace()
+                    .join("example.test/org/repo")
+                    .display()
+                    .to_string(),
+            ],
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn doctor_installs_over_commented_out_setup() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        let sb = Sandbox::new();
+        let rc = sb.home().join(if shell == "zsh" {
+            ".zshrc"
+        } else if cfg!(target_os = "macos") {
+            ".bash_profile"
+        } else {
+            ".bashrc"
+        });
+        let comment = format!("# To install later: eval \"$(git-clown init {shell})\"\n");
+        fs::write(&rc, &comment).unwrap();
+
+        let output = sb
+            .command(BIN)
+            .args(["doctor", "--install", "--shell", shell])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Added the"));
+        let content = fs::read_to_string(&rc).unwrap();
+        assert!(content.starts_with(&comment), "{shell}: {content}");
+        assert!(content.contains("# >>> git-clown shell integration >>>"));
+    }
 }

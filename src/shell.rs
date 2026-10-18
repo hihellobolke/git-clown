@@ -153,9 +153,32 @@ pub fn rc_state(shell: Shell, content: &str) -> RcState {
             RcState::Current
         }
         Some(_) => RcState::Outdated,
-        None if content.contains(&format!("git-clown init {}", shell.name())) => RcState::Manual,
+        None if loads_manually(shell, content) => RcState::Manual,
         None => RcState::Missing,
     }
+}
+
+/// Whether a non-comment part of `content` runs `git-clown init <shell>`.
+fn loads_manually(shell: Shell, content: &str) -> bool {
+    let command = format!("git-clown init {}", shell.name());
+    content
+        .lines()
+        .any(|line| strip_comment(line).contains(&command))
+}
+
+/// Drops a shell comment: a `#` at the start of a word and everything after it.
+fn strip_comment(line: &str) -> &str {
+    let comment_start = line
+        .char_indices()
+        .find(|&(i, c)| {
+            c == '#'
+                && line[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map_or(line.len(), |(i, _)| i);
+    &line[..comment_start]
 }
 
 /// Returns `content` with `shell`'s managed block added or refreshed, along
@@ -205,15 +228,30 @@ pub fn install(shell: Shell, rc_path: &Path) -> io::Result<InstallOutcome> {
 /// Writes `dir` (made absolute) to the file named by [`CD_FILE_ENV`], so the
 /// shell wrapper can `cd` there. Returns `Ok(false)` when not running under
 /// the wrapper.
+///
+/// The file holds the exact path bytes with no terminator, so paths
+/// containing newlines (or ending in one) survive; the wrapper reads the
+/// whole file.
 pub fn write_cd_target(dir: &Path) -> io::Result<bool> {
     match env::var_os(CD_FILE_ENV) {
         Some(file) if !file.is_empty() => {
             let dir = std::path::absolute(dir)?;
-            fs::write(file, format!("{}\n", dir.display()))?;
+            fs::write(file, path_bytes(&dir))?;
             Ok(true)
         }
         _ => Ok(false),
     }
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Replaces a leading home directory with `~` for display.
@@ -309,6 +347,25 @@ mod tests {
             upsert_block(Shell::Zsh, content).1,
             InstallOutcome::Unchanged
         );
+    }
+
+    #[test]
+    fn test_commented_setup_is_not_installed() {
+        for shell in [Shell::Bash, Shell::Zsh] {
+            let name = shell.name();
+            for content in [
+                format!("# To install later: eval \"$(git-clown init {name})\"\n"),
+                format!("   #eval \"$(git-clown init {name})\"\n"),
+                format!("echo hi # git-clown init {name}\n"),
+            ] {
+                assert_eq!(rc_state(shell, &content), RcState::Missing, "{content}");
+                assert_eq!(upsert_block(shell, &content).1, InstallOutcome::Added);
+            }
+            let trailing = format!("eval \"$(git-clown init {name})\" # load git-clown\n");
+            assert_eq!(rc_state(shell, &trailing), RcState::Manual);
+            let in_word = format!("eval \"$(git-clown init {name})\"#x\n");
+            assert_eq!(rc_state(shell, &in_word), RcState::Manual);
+        }
     }
 
     #[test]

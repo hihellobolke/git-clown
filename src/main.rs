@@ -512,6 +512,7 @@ async fn read_env_file(env_file_path: &Path) -> Result<HashMap<String, String>, 
 ///
 /// * `git_url` - The URL of the Git repository to clone
 /// * `dir_path` - The directory path where git clone should be executed (parent directory of the clone)
+/// * `clone_dir` - Name of the directory git clones into, inside `dir_path`
 /// * `env_vars` - Environment variables to pass to the git clone command
 ///
 /// # Returns
@@ -525,6 +526,7 @@ async fn read_env_file(env_file_path: &Path) -> Result<HashMap<String, String>, 
 async fn execute_git_clone(
     git_url: &str,
     dir_path: &Path,
+    clone_dir: &str,
     env_vars: &HashMap<String, String>,
 ) -> Result<std::process::ExitStatus, GitClownError> {
     info!(
@@ -534,7 +536,7 @@ async fn execute_git_clone(
     );
 
     // Create the command with current directory and merged environment applied.
-    let mut command = build_git_command(dir_path, &["clone", git_url], env_vars);
+    let mut command = build_git_command(dir_path, &["clone", git_url, clone_dir], env_vars);
 
     debug!("Running command: {:?}", command);
 
@@ -568,6 +570,22 @@ async fn execute_git_clone(
     }
 
     Ok(output.status)
+}
+
+/// Derives the directory name `git clone <url>` would create, the way git
+/// does: the last path component of the URL without a trailing `/`, `/.git`
+/// or `.git`.
+///
+/// Returns `None` when no usable name can be derived.
+fn clone_dir_name(git_url: &str) -> Option<String> {
+    let trimmed = git_url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/.git").unwrap_or(trimmed);
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    match name {
+        "" | "." | ".." => None,
+        name => Some(name.to_string()),
+    }
 }
 
 /// Builds a git command with a working directory, argument list, and a merged
@@ -990,16 +1008,22 @@ async fn run_clone(git_url: &str, bare: bool) -> Result<i32, GitClownError> {
         let worktree =
             run_bare_clone(git_url, &workspace_root, &host, &org, &repo, &env_vars).await?;
         (0, worktree)
-    } else if repository_exists(&dir_path, &repo).await {
-        info!(
-            "Repository {} already exists, skipping git clone",
-            repo.green()
-        );
-        (0, dir_path.join(&repo))
     } else {
-        // Execute git clone with environment variables
-        let status = execute_git_clone(git_url, &dir_path, &env_vars).await?;
-        (status.code().unwrap_or(1), dir_path.join(&repo))
+        // Name the clone directory explicitly, as git would, so the directory
+        // reported afterwards is exactly the one git created (nested
+        // namespaces like org/subgroup/repo clone into <org>/repo).
+        let clone_dir = clone_dir_name(git_url).unwrap_or_else(|| repo.clone());
+        if repository_exists(&dir_path, &clone_dir).await {
+            info!(
+                "Repository {} already exists, skipping git clone",
+                clone_dir.green()
+            );
+            (0, dir_path.join(&clone_dir))
+        } else {
+            // Execute git clone with environment variables
+            let status = execute_git_clone(git_url, &dir_path, &clone_dir, &env_vars).await?;
+            (status.code().unwrap_or(1), dir_path.join(&clone_dir))
+        }
     };
 
     if code == 0 {
@@ -1133,6 +1157,22 @@ mod tests {
     async fn test_parse_git_url_invalid() {
         let result = parse_git_url("not-a-url").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_clone_dir_name() {
+        let cases = [
+            ("https://github.com/example/repo.git", Some("repo")),
+            ("https://github.com/example/repo", Some("repo")),
+            ("https://github.com/example/repo/", Some("repo")),
+            ("https://gitlab.com/org/subgroup/repo.git", Some("repo")),
+            ("https://example.com/org/repo/.git", Some("repo")),
+            ("git@github.com:example/repo.git", Some("repo")),
+            ("git@host:repo.git", Some("repo")),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(clone_dir_name(url).as_deref(), expected, "{url}");
+        }
     }
 
     #[tokio::test]

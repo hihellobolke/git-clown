@@ -16,6 +16,21 @@ When `GIT_CLOWN_CD_FILE` is set and a clone succeeds, git-clown SHALL write the 
 - **WHEN** `git clown https://github.com/octocat/Hello-World.git` succeeds
 - **THEN** the shell's working directory is `$WORKSPACE_ROOT/github.com/octocat/Hello-World`
 
+#### Scenario: Nested namespace
+- **GIVEN** the integration is loaded
+- **WHEN** `git clown https://gitlab.com/org/subgroup/repo.git` succeeds
+- **THEN** the shell's working directory is the directory git cloned into, `$WORKSPACE_ROOT/gitlab.com/org/repo`
+
+#### Scenario: Path containing a newline
+- **GIVEN** `$WORKSPACE_ROOT` contains a newline
+- **WHEN** a clone through the wrapper succeeds
+- **THEN** the shell changes into the full path
+
+#### Scenario: Strict shell options
+- **GIVEN** the integration is loaded in a shell with `set -u`
+- **WHEN** the user runs `git` with no arguments
+- **THEN** the real `git` runs and the shell keeps going
+
 #### Scenario: Already cloned repository
 - **GIVEN** the repository already exists in the workspace
 - **WHEN** the user runs `git clown <url>` again

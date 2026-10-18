@@ -26,7 +26,12 @@
 - **WHEN** the user runs `git-clown doctor --install`
 - **THEN** only the block is replaced, and the rest of the file is kept
 
+#### Scenario: Commented-out setup line
+- **GIVEN** the rc file only mentions `git-clown init <shell>` in a comment
+- **WHEN** the user runs `git-clown doctor --install`
+- **THEN** the rc file counts as not installed and the block is added
+
 #### Scenario: Manual setup
-- **GIVEN** the rc file already contains `git-clown init <shell>` outside a managed block
+- **GIVEN** the rc file already runs `git-clown init <shell>` (not in a comment) outside a managed block
 - **WHEN** the user runs `git-clown doctor --install`
 - **THEN** the rc file is not modified

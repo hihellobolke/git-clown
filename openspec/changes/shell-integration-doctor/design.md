@@ -6,6 +6,13 @@
 
 ### D1: Hand off the path through a file, not stdout
 The wrapper creates a temp file with `mktemp` and runs `GIT_CLOWN_CD_FILE=<file> command git-clown "$@"`. After a successful clone the binary writes the absolute path into it. Parsing stdout would interfere with git's output and with users who pipe it. A file is unaffected by logging and works whatever `RUST_LOG` is.
+The file holds the exact path bytes with no terminator, and the wrapper reads the whole file (`$(cat f; printf x)`, then strips the `x`), so paths containing newlines survive.
+
+### D1b: git-clown names the clone directory
+The plain clone runs `git clone <url> <name>`, with `<name>` derived the way git derives it: the last URL path segment without `.git`. The directory that is checked for an existing clone, cloned into, and reported to the wrapper is therefore always the same, also for nested namespaces such as `org/subgroup/repo`, which land in `<host>/org/repo`.
+
+### D1c: Safe under strict shell options
+The functions expand arguments as `${1+"$@"}` and test `${1-}`, and initialize every local, so they work with `set -u` (including bash 3.2) and `set -e`.
 
 ### D2: `eval "$(git-clown init <shell>)"` in the rc file
 The rc block only evaluates the script the binary prints, so upgrading the binary also upgrades the functions. The block checks `command -v git-clown` first, so a missing binary does not break shell startup.
