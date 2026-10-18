@@ -16,6 +16,8 @@ Key features:
 - `git-clown doctor` to check your setup and install the shell integration
 - Optional terminal pager that renders the cloned repository's README (and these docs) as formatted markdown
 
+The full documentation (a getting-started tutorial, how-to guides, reference and explanation) is in [`docs/`](docs/README.md).
+
 ## Installation
 
 ### Prerequisites
@@ -204,7 +206,14 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Documentation
 
-To generate and view the documentation:
+The user documentation is in [`docs/`](docs/README.md):
+
+- [Getting started](docs/tutorials/getting-started.md), a tutorial for new users
+- [How-to guides](docs/README.md#how-to-guides-get-a-specific-job-done) for installing, setting up the shell integration, fixing problems with doctor, environment files, worktrees and the README pager
+- [Reference](docs/README.md#reference-look-up-the-details) for commands, options, configuration, the workspace layout, doctor checks and pager keys
+- [Explanation](docs/README.md#explanation-understand-the-design) of how and why git-clown works the way it does
+
+To generate and view the API documentation of the code:
 
 ```sh
 cargo doc --open
