@@ -8,7 +8,7 @@
 ## 2. Doctor
 
 - [x] 2.1 Checks: git, git-clown on PATH, workspace root, shell detection, current session
-- [x] 2.2 rc file state (missing / current / outdated / manual) and end-to-end self-test via hidden `__selftest-cd`
+- [x] 2.2 rc file state (missing / current / outdated, managed block only), setup by hand recognised through the wrapper, `-n` syntax check, and end-to-end self-test via hidden `__selftest-cd`
 - [x] 2.3 `--install` with an idempotent marked block, and a message naming the rc file and how to reload it
 - [x] 2.4 Interactive `[y/N]` offer to install (crossterm), only on a TTY
 

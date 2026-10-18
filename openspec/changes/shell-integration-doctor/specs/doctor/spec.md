@@ -31,7 +31,16 @@
 - **WHEN** the user runs `git-clown doctor --install`
 - **THEN** the rc file counts as not installed and the block is added
 
-#### Scenario: Manual setup
-- **GIVEN** the rc file already runs `git-clown init <shell>` (not in a comment) outside a managed block
+#### Scenario: Setup done by hand
+- **GIVEN** the user loads `git-clown init <shell>` themselves and there is no managed block
+- **WHEN** the user runs `git clown doctor` from a shell where the wrapper is loaded
+- **THEN** doctor sees the wrapper, reports the integration as set up and offers no install
+- **AND** lines outside the managed block are never parsed, so `--install` adds the block regardless (loading the functions twice is harmless)
+
+### Requirement: rc file syntax check
+Doctor SHALL have the shell parse the rc file without running it (`bash -n` / `zsh -n`) and SHALL report a syntax error as a failure. A syntax error stops the shell from reading the rest of the file, including the block.
+
+#### Scenario: Unterminated command substitution
+- **GIVEN** the rc file contains `value="$(true;# eval "$(git-clown init bash)" )"`, where the comment also swallows the closing `)"`
 - **WHEN** the user runs `git-clown doctor --install`
-- **THEN** the rc file is not modified
+- **THEN** the block is added, the rc syntax check fails with the shell's error message, and doctor exits with status 1

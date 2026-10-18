@@ -100,6 +100,10 @@ To set it up by hand, add this line to your rc file instead:
 eval "$(command git-clown init zsh)"   # or: init bash
 ```
 
+Doctor only recognises the marked block in rc files. If you set it up by hand,
+run `git clown doctor` from a shell that has it loaded: doctor then sees the
+wrapper and counts the integration as set up.
+
 How it works: `git-clown init <shell>` prints two shell functions. `git-clown`
 runs the real binary with `GIT_CLOWN_CD_FILE` pointing at a temp file. After a
 successful clone the binary writes the repository path into that file, and the
@@ -123,8 +127,11 @@ Checks your setup and reports what is missing:
 - the workspace root (`$WORKSPACE_ROOT` or `~/ws`)
 - your shell (from `$SHELL`), and whether the integration is loaded in the
   current session
-- whether the integration is in your rc file, plus a self-test that loads it in
-  a clean shell and checks that `git-clown` and `git clown` really `cd`
+- whether the integration block is in your rc file, and whether your shell can
+  parse that file (`bash -n` / `zsh -n`, nothing is run). A syntax error stops
+  the shell from reading the rest of the file, including the block.
+- a self-test that loads the integration in a clean shell and checks that
+  `git-clown` and `git clown` really `cd`
 
 If the integration is missing and you run doctor in a terminal, it asks whether
 to install it. Use `--install` to install without asking, and `--shell` to pick

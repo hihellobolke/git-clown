@@ -26,6 +26,9 @@ Doctor runs `bash --norc --noprofile -c` / `zsh -f -c` with the init script and 
 ### D5: The wrapper tells the binary it is there
 The wrapper also sets `GIT_CLOWN_SHELL=<shell>`. When doctor runs through the wrapper, it can report that the integration is loaded in the current session. Exported functions cannot be seen from a child process.
 
+### D5b: Doctor trusts only its own block and the real shell
+Doctor does not try to parse lines the user wrote (comments can hide inside quotes and command substitutions). It recognises only the exact managed block. A setup done by hand is recognised at runtime, through the wrapper's `GIT_CLOWN_SHELL`. The shell itself checks the rc file's syntax with `-n`, because a syntax error anywhere stops the rest of the file, including the block, from running.
+
 ### D6: crossterm only for the prompt
 The doctor report is plain line output, so it stays in scrollback and works when piped. A full-screen ratatui view would get in the way. crossterm's raw mode reads one key for `[y/N]`. The prompt only appears when stdin and stdout are terminals.
 

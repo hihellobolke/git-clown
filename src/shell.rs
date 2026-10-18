@@ -110,17 +110,21 @@ impl Shell {
     }
 }
 
-/// How the integration appears in an rc file.
+/// State of the managed block in an rc file.
+///
+/// Only the marked block is recognised. Lines the user wrote themselves are
+/// never parsed: telling a live `eval "$(git-clown init zsh)"` from one that
+/// is commented out (possibly inside quotes or a command substitution) needs
+/// a full shell parser. A setup done by hand is detected at runtime instead
+/// (see `doctor`), and loading the functions twice does no harm.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RcState {
-    /// No git-clown integration found.
+    /// No managed block.
     Missing,
     /// The managed block is present and up to date.
     Current,
     /// The managed block is present but differs from what this version writes.
     Outdated,
-    /// No managed block, but the user loads `git-clown init` themselves.
-    Manual,
 }
 
 /// Result of installing the integration into an rc file.
@@ -153,61 +157,8 @@ pub fn rc_state(shell: Shell, content: &str) -> RcState {
             RcState::Current
         }
         Some(_) => RcState::Outdated,
-        None if loads_manually(shell, content) => RcState::Manual,
         None => RcState::Missing,
     }
-}
-
-/// Whether a non-comment part of `content` runs `git-clown init <shell>`.
-fn loads_manually(shell: Shell, content: &str) -> bool {
-    strip_comments(content).contains(&format!("git-clown init {}", shell.name()))
-}
-
-/// Removes shell comments from `content`, following the shell's rule: an
-/// unquoted, unescaped `#` at the start of a word (after whitespace, an
-/// operator such as `;`, `&`, `|`, `(`, `)`, `<`, `>`, or at the start of
-/// the input) comments out the rest of the line. Quote state carries across
-/// lines, so a `#` inside a multi-line string is kept.
-fn strip_comments(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let (mut single, mut double, mut escaped, mut in_comment) = (false, false, false, false);
-    // Whether the next character would start a new word.
-    let mut word_start = true;
-
-    for c in content.chars() {
-        if in_comment {
-            if c == '\n' {
-                in_comment = false;
-                word_start = true;
-                out.push(c);
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            word_start = false;
-        } else if single {
-            single = c != '\'';
-        } else if c == '\\' {
-            escaped = true;
-            word_start = false;
-        } else if c == '"' {
-            double = !double;
-            word_start = false;
-        } else if double {
-            // Everything else inside double quotes is literal for our purposes.
-        } else if c == '\'' {
-            single = true;
-            word_start = false;
-        } else if c == '#' && word_start {
-            in_comment = true;
-            continue;
-        } else {
-            word_start = c.is_whitespace() || ";&|()<>".contains(c);
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Returns `content` with `shell`'s managed block added or refreshed, along
@@ -215,7 +166,7 @@ fn strip_comments(content: &str) -> String {
 pub fn upsert_block(shell: Shell, content: &str) -> (String, InstallOutcome) {
     let block = shell.rc_block();
     match (rc_state(shell, content), find_block(content)) {
-        (RcState::Current | RcState::Manual, _) => (content.to_string(), InstallOutcome::Unchanged),
+        (RcState::Current, _) => (content.to_string(), InstallOutcome::Unchanged),
         (RcState::Outdated, Some(range)) => {
             let mut updated = content.to_string();
             updated.replace_range(range, &block);
@@ -368,45 +319,22 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_setup_is_respected() {
-        let content = "eval \"$(git-clown init zsh)\"\n";
-        assert_eq!(rc_state(Shell::Zsh, content), RcState::Manual);
-        assert_eq!(rc_state(Shell::Bash, content), RcState::Missing);
-        assert_eq!(
-            upsert_block(Shell::Zsh, content).1,
-            InstallOutcome::Unchanged
-        );
-    }
-
-    #[test]
-    fn test_commented_setup_is_not_installed() {
+    fn test_user_written_lines_do_not_block_install() {
+        // Whether live or commented out, lines outside the managed block are
+        // not trusted; the block is added (and is harmless next to a live one).
         for shell in [Shell::Bash, Shell::Zsh] {
             let name = shell.name();
             for content in [
+                format!("eval \"$(git-clown init {name})\"\n"),
                 format!("# To install later: eval \"$(git-clown init {name})\"\n"),
-                format!("   #eval \"$(git-clown init {name})\"\n"),
-                format!("echo hi # git-clown init {name}\n"),
                 format!("true;# eval \"$(git-clown init {name})\"\n"),
-                format!("true &&#eval \"$(git-clown init {name})\"\n"),
-                format!("(true)# git-clown init {name}\n"),
-                format!("x=1|#git-clown init {name}\n"),
-                format!("echo 'a\n# b' # git-clown init {name}\n"),
+                format!("value=\"$(true;# eval \"$(git-clown init {name})\" )\"\n"),
             ] {
                 assert_eq!(rc_state(shell, &content), RcState::Missing, "{content}");
-                assert_eq!(upsert_block(shell, &content).1, InstallOutcome::Added);
-            }
-            let trailing = format!("eval \"$(git-clown init {name})\" # load git-clown\n");
-            assert_eq!(rc_state(shell, &trailing), RcState::Manual);
-            let in_word = format!("eval \"$(git-clown init {name})\"#x\n");
-            assert_eq!(rc_state(shell, &in_word), RcState::Manual);
-            for active in [
-                format!("echo '#'; eval \"$(git-clown init {name})\"\n"),
-                format!("echo \"#\" ; eval \"$(git-clown init {name})\"\n"),
-                format!("echo \\# ; eval \"$(git-clown init {name})\"\n"),
-                format!("echo ${{#PATH}}; eval \"$(git-clown init {name})\"\n"),
-                format!("true;eval \"$(git-clown init {name})\"\n"),
-            ] {
-                assert_eq!(rc_state(shell, &active), RcState::Manual, "{active}");
+                let (updated, outcome) = upsert_block(shell, &content);
+                assert_eq!(outcome, InstallOutcome::Added, "{content}");
+                assert_eq!(rc_state(shell, &updated), RcState::Current);
+                assert_eq!(upsert_block(shell, &updated).1, InstallOutcome::Unchanged);
             }
         }
     }

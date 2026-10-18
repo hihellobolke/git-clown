@@ -270,11 +270,34 @@ fn doctor_install_is_idempotent_and_loads_in_interactive_shell() {
 }
 
 #[test]
-fn doctor_reports_active_session_through_wrapper() {
-    let sb = Sandbox::new();
-    let output = sb.run_in_shell("bash", "git clown doctor --shell bash");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("integration loaded (bash)"), "{stdout}");
+fn doctor_recognizes_hand_loaded_integration_through_wrapper() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        // The integration is loaded with eval and there is no rc file at all:
+        // doctor, run through the wrapper, counts it as set up and offers nothing.
+        let sb = Sandbox::new();
+        let output = sb.run_in_shell(shell, &format!("git clown doctor --shell {shell}"));
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("integration loaded ({shell})")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("loaded in this session"), "{stdout}");
+        assert!(!stdout.contains("To install it"), "{stdout}");
+        assert!(
+            fs::read_dir(sb.home()).unwrap().next().is_none(),
+            "{shell}: rc written"
+        );
+
+        // Without the wrapper the same setup is reported as not installed.
+        let output = sb
+            .command(BIN)
+            .args(["doctor", "--shell", shell])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{shell}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("not installed"));
+    }
 }
 
 #[test]
@@ -348,6 +371,9 @@ fn doctor_installs_over_commented_out_setup() {
         for comment in [
             format!("# To install later: eval \"$(git-clown init {shell})\"\n"),
             format!("true;# eval \"$(git-clown init {shell})\"\n"),
+            // A live hand-written setup: the block is added next to it, and
+            // loading the functions twice is harmless.
+            format!("eval \"$(command git-clown init {shell})\"\n"),
         ] {
             let sb = Sandbox::new();
             let rc = sb.home().join(if shell == "zsh" {
@@ -388,6 +414,89 @@ fn doctor_installs_over_commented_out_setup() {
                 2,
                 "{shell} {comment}: {stdout}"
             );
+
+            // And a clone from that shell lands in the repository.
+            let output = sb
+                .command(shell)
+                .args([
+                    "-i",
+                    "-c",
+                    "git clown https://example.test/org/repo.git >/dev/null 2>&1 && pwd",
+                ])
+                .output()
+                .unwrap();
+            let repo = sb.workspace().join("example.test/org/repo");
+            assert_eq!(
+                stdout_lines(&output).last(),
+                Some(&repo.display().to_string()),
+                "{shell} {comment}"
+            );
         }
+    }
+}
+
+#[test]
+fn doctor_installs_and_reports_rc_syntax_error() {
+    for shell in ["bash", "zsh"].into_iter().filter(|s| shell_available(s)) {
+        let sb = Sandbox::new();
+        let rc = sb.home().join(if shell == "zsh" {
+            ".zshrc"
+        } else if cfg!(target_os = "macos") {
+            ".bash_profile"
+        } else {
+            ".bashrc"
+        });
+        // The `#` comments out the closing `)"` as well, so the command
+        // substitution never ends: the line is a syntax error in both shells
+        // and nothing after it runs.
+        let line = format!("value=\"$(true;# eval \"$(git-clown init {shell})\" )\"\n");
+        fs::write(&rc, &line).unwrap();
+
+        let output = sb
+            .command(BIN)
+            .args(["doctor", "--install", "--shell", shell])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Added the"), "{shell}: {stdout}");
+        assert!(stdout.contains("installed in"), "{shell}: {stdout}");
+        assert!(stdout.contains("✗ rc syntax"), "{shell}: {stdout}");
+        assert!(stdout.contains("never run"), "{shell}: {stdout}");
+        assert!(
+            !output.status.success(),
+            "{shell}: a broken rc must fail doctor"
+        );
+        let content = fs::read_to_string(&rc).unwrap();
+        assert!(content.starts_with(&line), "{shell}: {content}");
+        assert!(content.contains("# >>> git-clown shell integration >>>"));
+
+        // Once the user fixes the line, the installed block loads.
+        fs::write(&rc, content.replacen(&line, "value=\"$(true)\"\n", 1)).unwrap();
+        let output = sb
+            .command(BIN)
+            .args(["doctor", "--shell", shell])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("✓ rc syntax"), "{shell}: {stdout}");
+        let output = sb
+            .command(shell)
+            .args([
+                "-i",
+                "-c",
+                "git clown https://example.test/org/repo.git >/dev/null 2>&1 && pwd",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            stdout_lines(&output).last(),
+            Some(
+                &sb.workspace()
+                    .join("example.test/org/repo")
+                    .display()
+                    .to_string()
+            ),
+            "{shell}"
+        );
     }
 }

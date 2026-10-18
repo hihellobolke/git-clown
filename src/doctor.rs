@@ -106,7 +106,11 @@ pub fn run(args: &DoctorArgs) -> i32 {
     let fixable: Vec<(Shell, RcState)> = shells
         .iter()
         .filter_map(|&shell| Some((shell, rc_state_of(shell)?)))
-        .filter(|(_, state)| matches!(state, RcState::Missing | RcState::Outdated))
+        .filter(|&(shell, ref state)| match state {
+            RcState::Missing => !loaded_in_session(shell),
+            RcState::Outdated => true,
+            RcState::Current => false,
+        })
         .collect();
 
     if fixable.is_empty() {
@@ -311,8 +315,8 @@ fn shell_overview_section(detected: Option<Shell>, shells: &[Shell]) -> Section 
         ),
     };
 
-    let session_check = match env::var(shell::SHELL_ENV) {
-        Ok(name) if env::var_os(shell::CD_FILE_ENV).is_some() => Check::new(
+    let session_check = match session_shell() {
+        Some(name) => Check::new(
             Status::Ok,
             "this session",
             format!("integration loaded ({name}); `git clown <url>` will cd into the clone"),
@@ -339,6 +343,19 @@ fn shell_overview_section(detected: Option<Shell>, shells: &[Shell]) -> Section 
     }
 }
 
+/// The shell whose wrapper ran this process, if any. The wrapper sets both
+/// variables, so this is runtime evidence that the integration is loaded.
+fn session_shell() -> Option<String> {
+    env::var_os(shell::CD_FILE_ENV)?;
+    env::var(shell::SHELL_ENV).ok()
+}
+
+/// Whether doctor runs through `shell`'s wrapper, i.e. the integration is
+/// loaded in the calling shell (however the user set it up).
+fn loaded_in_session(shell: Shell) -> bool {
+    session_shell().as_deref() == Some(shell.name())
+}
+
 /// Reads `shell`'s rc file and reports how the integration appears in it.
 fn rc_state_of(shell: Shell) -> Option<RcState> {
     let rc = shell.rc_file()?;
@@ -353,9 +370,12 @@ fn shell_section(shell: Shell) -> Section {
             let rc = shell::tildify(&rc);
             match state {
                 RcState::Current => Check::new(Status::Ok, "rc file", format!("installed in {rc}")),
-                RcState::Manual => {
-                    Check::new(Status::Ok, "rc file", format!("loaded manually in {rc}"))
-                }
+                RcState::Missing if loaded_in_session(shell) => Check::new(
+                    Status::Ok,
+                    "rc file",
+                    format!("no managed block in {rc}, but loaded in this session"),
+                )
+                .hint("Set up by hand; `git-clown doctor --install` would add the managed block"),
                 RcState::Outdated => {
                     Check::new(Status::Warn, "rc file", format!("outdated block in {rc}"))
                         .hint("Run `git-clown doctor --install` to refresh it")
@@ -363,7 +383,8 @@ fn shell_section(shell: Shell) -> Section {
                 RcState::Missing => {
                     Check::new(Status::Fail, "rc file", format!("not installed in {rc}")).hint(
                         format!(
-                            "Run `git-clown doctor --install --shell {}`, or add `{}` to {rc}",
+                            "Run `git-clown doctor --install --shell {}`. If you load it yourself \
+                             with `{}`, run `git clown doctor` from that shell to confirm",
                             shell.name(),
                             shell.load_command()
                         ),
@@ -377,6 +398,24 @@ fn shell_section(shell: Shell) -> Section {
             "could not determine your home directory",
         ),
     };
+
+    let syntax_check = shell
+        .rc_file()
+        .filter(|rc| rc.is_file() && find_on_path(shell.name()).is_some())
+        .map(|rc| match check_rc_syntax(shell, &rc) {
+            Ok(()) => Check::new(
+                Status::Ok,
+                "rc syntax",
+                format!("{} parses it cleanly", shell.name()),
+            ),
+            Err(e) => Check::new(Status::Fail, "rc syntax", e).hint(format!(
+                "{} cannot parse {}, so the commands from the broken spot on never run, \
+                 including the git-clown block. Fix it (an unclosed quote, `$(`, `if` or \
+                 `{{` often shows up as an error at the end of the file) and reload.",
+                shell.name(),
+                shell::tildify(&rc)
+            )),
+        });
 
     let self_test = match find_on_path(shell.name()) {
         None => Check::new(
@@ -399,7 +438,41 @@ fn shell_section(shell: Shell) -> Section {
 
     Section {
         title: format!("Shell integration ({})", shell.name()),
-        checks: vec![rc_check, self_test],
+        checks: [Some(rc_check), syntax_check, Some(self_test)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    }
+}
+
+/// Has `shell` parse `rc` without running it (`-n`) and returns the first
+/// error it reports.
+fn check_rc_syntax(shell: Shell, rc: &Path) -> Result<(), String> {
+    let output = Command::new(shell.name())
+        .args(no_rc_args(shell))
+        .arg("-n")
+        .arg(rc)
+        .env_remove("BASH_ENV")
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", shell.name()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("syntax error");
+    // Shells prefix the message with the full rc path; show it with `~`.
+    let rc_path = rc.display().to_string();
+    Err(message.trim().replace(&rc_path, &shell::tildify(rc)))
+}
+
+/// Options that keep `shell` from reading any startup files.
+fn no_rc_args(shell: Shell) -> &'static [&'static str] {
+    match shell {
+        Shell::Bash => &["--norc", "--noprofile"],
+        Shell::Zsh => &["-f"],
     }
 }
 
@@ -420,13 +493,9 @@ pub fn self_test(shell: Shell, exe: &Path) -> Result<(), String> {
          [ \"$PWD\" = \"$1\" ] || {{ echo \"git clown left the shell in $PWD\" >&2; exit 94; }}\n",
         shell.init_script()
     );
-    let no_rc: &[&str] = match shell {
-        Shell::Bash => &["--norc", "--noprofile"],
-        Shell::Zsh => &["-f"],
-    };
 
     let output = Command::new(shell.name())
-        .args(no_rc)
+        .args(no_rc_args(shell))
         .arg("-c")
         .arg(&script)
         .arg("git-clown-selftest")
